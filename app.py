@@ -20,13 +20,13 @@ import html
 import xml.etree.ElementTree as ET
 from email.utils import parsedate_to_datetime
 from typing import Any
-from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote_plus
 
 import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "2026-06-17-rss-japan-buzz-top1000-strict-japanlike"
+APP_VERSION = "2026-06-17-rss-japan-buzz-top1000-no-neet-title-translate"
 DEFAULT_RANKING_LIMIT = 30
 MAX_RANKING_LIMIT = 100
 
@@ -1814,9 +1814,90 @@ def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False, quoting=csv.QUOTE_MINIMAL).encode("utf-8-sig")
 
 
+def build_google_translate_url(title: str) -> str:
+    """Build a Google Translate web URL. This does not call/scrape Google Translate."""
+    text = quote_plus(str(title or ""))
+    return f"https://translate.google.com/?sl=en&tl=ja&text={text}&op=translate"
+
+
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def translate_title_libre_cached(
+    title: str,
+    endpoint: str,
+    api_key: str = "",
+    timeout_sec: int = 10,
+) -> str:
+    """Translate one title using a LibreTranslate-compatible /translate endpoint.
+
+    The app does not bundle or call any paid AI API. If endpoint is blank, translation is skipped.
+    Expected response format: {"translatedText": "..."}.
+    """
+    title = str(title or "").strip()
+    endpoint = str(endpoint or "").strip()
+    if not title or not endpoint:
+        return ""
+
+    url = endpoint.rstrip("/")
+    if not url.endswith("/translate"):
+        url = url + "/translate"
+
+    payload: dict[str, Any] = {
+        "q": title,
+        "source": "en",
+        "target": "ja",
+        "format": "text",
+    }
+    if api_key:
+        payload["api_key"] = api_key
+
+    try:
+        r = requests.post(url, json=payload, timeout=timeout_sec)
+        if r.status_code >= 400:
+            return ""
+        data = r.json()
+        translated = data.get("translatedText") or data.get("translated_text") or ""
+        return str(translated).strip()
+    except Exception:
+        return ""
+
+
+def add_translation_columns(
+    df: pd.DataFrame,
+    mode: str,
+    endpoint: str,
+    api_key: str,
+    timeout_sec: int,
+) -> pd.DataFrame:
+    out = df.copy()
+    out["translate_url"] = out["title"].apply(build_google_translate_url)
+    out["title_ja"] = ""
+
+    if mode == "LibreTranslate互換APIで和訳" and endpoint.strip():
+        translated: list[str] = []
+        for title in out["title"].fillna("").astype(str).tolist():
+            translated.append(
+                translate_title_libre_cached(
+                    title=title,
+                    endpoint=endpoint.strip(),
+                    api_key=api_key.strip(),
+                    timeout_sec=timeout_sec,
+                )
+            )
+            time.sleep(0.03)
+        out["title_ja"] = translated
+
+    return out
+
+
 def render_result_cards(df: pd.DataFrame) -> None:
     for _, row in df.iterrows():
         st.markdown(f"### {int(row['rank'])}. [{row['title']}]({row['url']})")
+        title_ja = str(row.get("title_ja", "") or "").strip()
+        if title_ja:
+            st.write(f"**和訳:** {title_ja}")
+        translate_url = str(row.get("translate_url", "") or "").strip()
+        if translate_url:
+            st.markdown(f"[タイトルをGoogle翻訳で開く]({translate_url})")
         st.caption(
             f"score={row['score']} | raw={row.get('raw_score', '')} | cat decay={row.get('category_decay_multiplier', '')} | raw hits={row['term_total_hits']} | decayed={row.get('term_decayed_hits', '')} | "
             f"unique={row['unique_term_hits']} | {row['source']} / {row['category']} | "
@@ -1860,6 +1941,36 @@ def main() -> None:
             value=DEFAULT_RANKING_LIMIT,
             step=1,
         )
+
+        st.markdown("---")
+        st.subheader("タイトル和訳")
+        translation_mode = st.selectbox(
+            "和訳モード",
+            ["OFF", "翻訳リンクのみ", "LibreTranslate互換APIで和訳"],
+            index=0,
+        )
+        try:
+            default_translate_endpoint = st.secrets.get("LIBRETRANSLATE_ENDPOINT", "")
+            default_translate_key = st.secrets.get("LIBRETRANSLATE_API_KEY", "")
+        except Exception:
+            default_translate_endpoint = ""
+            default_translate_key = ""
+        libre_endpoint = ""
+        libre_api_key = ""
+        translation_timeout_sec = 10
+        if translation_mode == "LibreTranslate互換APIで和訳":
+            libre_endpoint = st.text_input(
+                "LibreTranslate互換エンドポイント",
+                value=default_translate_endpoint,
+                placeholder="https://your-libretranslate.example.com",
+            )
+            libre_api_key = st.text_input(
+                "APIキー（必要な場合のみ）",
+                value=default_translate_key,
+                type="password",
+            )
+            translation_timeout_sec = st.slider("和訳APIタイムアウト 秒", 3, 30, 10, 1)
+            st.caption("未設定の場合はAPI和訳を行わず、翻訳リンクだけ表示します。")
 
         sources = sorted({f["source"] for f in RSS_FEEDS})
         categories = sorted({f["category"] for f in RSS_FEEDS})
@@ -1917,6 +2028,16 @@ def main() -> None:
     if df.empty:
         st.warning("条件に合う記事が見つかりませんでした。期間を長くする、取得件数を増やす、媒体カテゴリを増やすなどを試してください。")
     else:
+        if translation_mode != "OFF":
+            with st.spinner("タイトル和訳列を作成しています..."):
+                df = add_translation_columns(
+                    df=df,
+                    mode=translation_mode,
+                    endpoint=libre_endpoint,
+                    api_key=libre_api_key,
+                    timeout_sec=translation_timeout_sec,
+                )
+
         c1, c2, c3 = st.columns(3)
         c1.metric("表示件数", f"{len(df)} / {ranking_limit}")
         c2.metric("最高補正後スコア", float(df["score"].max()))
@@ -1941,11 +2062,14 @@ def main() -> None:
             "term_categories",
             "matched_terms",
             "title",
+            "title_ja",
+            "translate_url",
             "source",
             "category",
             "published",
             "url",
         ]
+        display_cols = [c for c in display_cols if c in df.columns]
         st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
 
         st.markdown("---")
