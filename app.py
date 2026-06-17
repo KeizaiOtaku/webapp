@@ -1,616 +1,878 @@
-import html
+# app.py
+# Streamlit app: English overseas RSS Japan-buzz ranker
+# - No article-body scraping
+# - Excludes RSS sources previously identified as clearly restricted for commercial/non-commercial use
+# - Ranks English RSS items by Japan-specific 300-term hits in title / URL / metadata
+
+from __future__ import annotations
+
+import calendar
+import csv
 import math
-import random
 import re
 import time
-from datetime import datetime, timezone
-from typing import Dict, List, Tuple
-from urllib.parse import unquote, urlparse
+import unicodedata
+from datetime import datetime, timedelta, timezone
+from io import StringIO
+from typing import Any
+from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
+import feedparser
 import pandas as pd
 import requests
 import streamlit as st
 
+APP_VERSION = "2026-06-17-rss-japan-buzz-300"
+MAX_RANKING = 30
 
-# ============================================================
-# アプリ設定
-# ============================================================
+# Japan / Japanese are intentionally NOT included here.
+# These 300 terms are used only for scoring after RSS items are collected.
+JAPAN_SPECIFIC_TERMS_300 = ['yen',
+ 'Bank of Japan',
+ 'BOJ',
+ 'Nikkei',
+ 'TOPIX',
+ 'Tokyo Stock Exchange',
+ 'TSE',
+ 'JGB',
+ 'government bonds',
+ 'LDP',
+ 'Komeito',
+ 'Constitutional Democratic Party',
+ 'Diet',
+ 'National Diet',
+ 'House of Representatives',
+ 'House of Councillors',
+ "Prime Minister's Office",
+ 'Kantei',
+ 'Self-Defense Forces',
+ 'SDF',
+ 'JSDF',
+ 'Okinawa bases',
+ 'Futenma',
+ 'Henoko',
+ 'Senkaku',
+ 'Northern Territories',
+ 'Yasukuni',
+ 'imperial family',
+ 'Emperor Naruhito',
+ 'Imperial Household Agency',
+ 'My Number',
+ 'consumer tax',
+ 'shunto',
+ 'keidanren',
+ 'zaibatsu',
+ 'keiretsu',
+ 'sogo shosha',
+ 'salaryman',
+ 'karoshi',
+ 'hikikomori',
+ 'aging population',
+ 'birth rate',
+ 'depopulation',
+ 'labor shortage',
+ 'technical intern',
+ 'Tokyo',
+ 'Osaka',
+ 'Kyoto',
+ 'Hokkaido',
+ 'Okinawa',
+ 'Mount Fuji',
+ 'Fuji',
+ 'Shibuya',
+ 'Shinjuku',
+ 'Akihabara',
+ 'Ginza',
+ 'Asakusa',
+ 'Harajuku',
+ 'Roppongi',
+ 'Ueno',
+ 'Ikebukuro',
+ 'Yokohama',
+ 'Kamakura',
+ 'Kobe',
+ 'Nara',
+ 'Hiroshima',
+ 'Nagasaki',
+ 'Fukuoka',
+ 'Sapporo',
+ 'Nagoya',
+ 'Kanazawa',
+ 'Sendai',
+ 'Kumamoto',
+ 'Kagoshima',
+ 'Nikko',
+ 'Hakone',
+ 'Izu',
+ 'Noto Peninsula',
+ 'Tohoku',
+ 'Kansai',
+ 'Kyushu',
+ 'Shikoku',
+ 'Chubu',
+ 'Kanto',
+ 'Setouchi',
+ 'Miyajima',
+ 'Naoshima',
+ 'Shinkansen',
+ 'JR Pass',
+ 'Suica',
+ 'sushi',
+ 'ramen',
+ 'udon',
+ 'soba',
+ 'tempura',
+ 'wagyu',
+ 'kobe beef',
+ 'matcha',
+ 'sake',
+ 'nihonshu',
+ 'shochu',
+ 'umeshu',
+ 'bento',
+ 'onigiri',
+ 'takoyaki',
+ 'okonomiyaki',
+ 'yakitori',
+ 'tonkatsu',
+ 'curry rice',
+ 'omakase',
+ 'kaiseki',
+ 'izakaya',
+ 'miso',
+ 'natto',
+ 'tofu',
+ 'mochi',
+ 'daifuku',
+ 'dorayaki',
+ 'taiyaki',
+ 'umami',
+ 'kimono',
+ 'yukata',
+ 'geisha',
+ 'maiko',
+ 'samurai',
+ 'ninja',
+ 'shogun',
+ 'daimyo',
+ 'bushido',
+ 'katana',
+ 'wakizashi',
+ 'shuriken',
+ 'Shinto',
+ 'torii',
+ 'kami',
+ 'miko',
+ 'omamori',
+ 'ema',
+ 'shrine',
+ 'temple',
+ 'matsuri',
+ 'hanami',
+ 'sakura',
+ 'cherry blossoms',
+ 'bonsai',
+ 'ikebana',
+ 'tea ceremony',
+ 'tatami',
+ 'futon',
+ 'kabuki',
+ 'noh',
+ 'bunraku',
+ 'rakugo',
+ 'haiku',
+ 'ukiyo-e',
+ 'Hokusai',
+ 'Edo',
+ 'Meiji',
+ 'Heian',
+ 'Sengoku',
+ 'Ainu',
+ 'Ryukyu',
+ 'wabi-sabi',
+ 'kintsugi',
+ 'origami',
+ 'anime',
+ 'manga',
+ 'otaku',
+ 'cosplay',
+ 'comiket',
+ 'doujinshi',
+ 'light novel',
+ 'visual novel',
+ 'isekai',
+ 'shonen',
+ 'shojo',
+ 'seinen',
+ 'josei',
+ 'mecha',
+ 'magical girl',
+ 'kawaii',
+ 'moe',
+ 'tsundere',
+ 'yandere',
+ 'waifu',
+ 'husbando',
+ 'senpai',
+ 'sensei',
+ 'chibi',
+ 'chuunibyou',
+ 'gacha',
+ 'gachapon',
+ 'purikura',
+ 'maid cafe',
+ 'idol',
+ 'J-pop',
+ 'J-rock',
+ 'city pop',
+ 'enka',
+ 'Vocaloid',
+ 'Hatsune Miku',
+ 'VTuber',
+ 'Hololive',
+ 'Nijisanji',
+ 'virtual idol',
+ 'Niconico',
+ 'Pixiv',
+ 'Line stickers',
+ 'tokusatsu',
+ 'kaiju',
+ 'Studio Ghibli',
+ 'Hayao Miyazaki',
+ 'Ghibli Park',
+ 'Totoro',
+ 'Spirited Away',
+ 'Princess Mononoke',
+ 'Pokemon',
+ 'Pikachu',
+ 'Godzilla',
+ 'Toho',
+ 'Ultraman',
+ 'Gundam',
+ 'Evangelion',
+ 'One Piece',
+ 'Demon Slayer',
+ 'Kimetsu no Yaiba',
+ 'Dragon Ball',
+ 'Naruto',
+ 'Boruto',
+ 'Jujutsu Kaisen',
+ 'Attack on Titan',
+ 'My Hero Academia',
+ 'Chainsaw Man',
+ 'Spy x Family',
+ 'Sailor Moon',
+ 'Detective Conan',
+ 'Doraemon',
+ 'Hello Kitty',
+ 'Sanrio',
+ 'Aggretsuko',
+ 'Rilakkuma',
+ 'Chiikawa',
+ 'Anpanman',
+ 'Crayon Shin-chan',
+ 'Yu-Gi-Oh',
+ 'Beyblade',
+ 'Digimon',
+ 'Tamagotchi',
+ 'Final Fantasy',
+ 'Dragon Quest',
+ 'Kingdom Hearts',
+ 'Persona',
+ 'Monster Hunter',
+ 'Resident Evil',
+ 'Street Fighter',
+ 'Tekken',
+ 'Yakuza',
+ 'Like a Dragon',
+ 'Mario',
+ 'Zelda',
+ 'Toyota',
+ 'Honda',
+ 'Nissan',
+ 'Mazda',
+ 'Subaru',
+ 'Suzuki',
+ 'Mitsubishi Motors',
+ 'Lexus',
+ 'Yamaha',
+ 'Kawasaki',
+ 'Sony',
+ 'Nintendo',
+ 'SoftBank',
+ 'Rakuten',
+ 'NTT',
+ 'KDDI',
+ 'Panasonic',
+ 'Hitachi',
+ 'Toshiba',
+ 'Sharp',
+ 'Fujitsu',
+ 'NEC',
+ 'Canon',
+ 'Nikon',
+ 'Olympus',
+ 'Shohei Ohtani',
+ 'Ohtani',
+ 'Yoshinobu Yamamoto',
+ 'Roki Sasaki',
+ 'Ichiro',
+ 'Yuzuru Hanyu',
+ 'Naomi Osaka',
+ 'sumo',
+ 'yokozuna',
+ 'earthquake',
+ 'tsunami',
+ 'typhoon',
+ 'volcano',
+ 'Fukushima Daiichi',
+ 'Nankai Trough']
 
-APP_VERSION = "2026-06-17-japan-specific-term-ranker-fixed102"
-GDELT_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
-USER_AGENT = "overseas-japan-term-ranker-streamlit/1.0"
-CACHE_TTL_SECONDS = 60 * 30
+# Conservative initial RSS list.
+# Excluded from this initial list: Guardian, Washington Post, Le Monde, Google News RSS, Reuters RSS.
+RSS_FEEDS = [{'category': 'top', 'source': 'BBC News', 'url': 'http://feeds.bbci.co.uk/news/rss.xml', 'weight': 5},
+ {'category': 'world', 'source': 'BBC News', 'url': 'http://feeds.bbci.co.uk/news/world/rss.xml', 'weight': 5},
+ {'category': 'business', 'source': 'BBC News', 'url': 'http://feeds.bbci.co.uk/news/business/rss.xml', 'weight': 4},
+ {'category': 'technology',
+  'source': 'BBC News',
+  'url': 'http://feeds.bbci.co.uk/news/technology/rss.xml',
+  'weight': 4},
+ {'category': 'entertainment',
+  'source': 'BBC News',
+  'url': 'http://feeds.bbci.co.uk/news/entertainment_and_arts/rss.xml',
+  'weight': 3},
+ {'category': 'top', 'source': 'ABC News', 'url': 'https://feeds.abcnews.com/abcnews/topstories', 'weight': 4},
+ {'category': 'international',
+  'source': 'ABC News',
+  'url': 'https://feeds.abcnews.com/abcnews/internationalheadlines',
+  'weight': 5},
+ {'category': 'business', 'source': 'ABC News', 'url': 'https://feeds.abcnews.com/abcnews/moneyheadlines', 'weight': 3},
+ {'category': 'technology',
+  'source': 'ABC News',
+  'url': 'https://feeds.abcnews.com/abcnews/technologyheadlines',
+  'weight': 3},
+ {'category': 'entertainment',
+  'source': 'ABC News',
+  'url': 'https://feeds.abcnews.com/abcnews/entertainmentheadlines',
+  'weight': 3},
+ {'category': 'travel', 'source': 'ABC News', 'url': 'https://feeds.abcnews.com/abcnews/travelheadlines', 'weight': 3},
+ {'category': 'top', 'source': 'CBS News', 'url': 'https://www.cbsnews.com/latest/rss/main', 'weight': 4},
+ {'category': 'world', 'source': 'CBS News', 'url': 'https://www.cbsnews.com/latest/rss/world', 'weight': 4},
+ {'category': 'moneywatch', 'source': 'CBS News', 'url': 'https://www.cbsnews.com/latest/rss/moneywatch', 'weight': 3},
+ {'category': 'science', 'source': 'CBS News', 'url': 'https://www.cbsnews.com/latest/rss/science', 'weight': 3},
+ {'category': 'technology', 'source': 'CBS News', 'url': 'https://www.cbsnews.com/latest/rss/technology', 'weight': 3},
+ {'category': 'entertainment',
+  'source': 'CBS News',
+  'url': 'https://www.cbsnews.com/latest/rss/entertainment',
+  'weight': 3},
+ {'category': 'news',
+  'source': 'Euronews',
+  'url': 'https://www.euronews.com/rss?format=mrss&level=theme&name=news',
+  'weight': 4},
+ {'category': 'travel',
+  'source': 'Euronews',
+  'url': 'https://www.euronews.com/rss?format=mrss&level=theme&name=travel',
+  'weight': 3},
+ {'category': 'culture',
+  'source': 'Euronews',
+  'url': 'https://www.euronews.com/rss?format=mrss&level=theme&name=culture',
+  'weight': 3},
+ {'category': 'technology',
+  'source': 'Euronews',
+  'url': 'https://www.euronews.com/rss?format=mrss&level=theme&name=next',
+  'weight': 3},
+ {'category': 'all', 'source': 'DW', 'url': 'https://rss.dw.com/rdf/rss-en-all', 'weight': 4},
+ {'category': 'all', 'source': 'France 24', 'url': 'https://www.france24.com/en/rss', 'weight': 4},
+ {'category': 'asia-pacific',
+  'source': 'France 24',
+  'url': 'https://www.france24.com/en/asia-pacific/rss',
+  'weight': 4},
+ {'category': 'business-tech',
+  'source': 'France 24',
+  'url': 'https://www.france24.com/en/business-tech/rss',
+  'weight': 3},
+ {'category': 'culture', 'source': 'France 24', 'url': 'https://www.france24.com/en/culture/rss', 'weight': 3},
+ {'category': 'all', 'source': 'Al Jazeera', 'url': 'https://www.aljazeera.com/xml/rss/all.xml', 'weight': 4},
+ {'category': 'tech', 'source': 'The Verge', 'url': 'https://www.theverge.com/rss/index.xml', 'weight': 4},
+ {'category': 'technology',
+  'source': 'Ars Technica',
+  'url': 'https://feeds.arstechnica.com/arstechnica/index',
+  'weight': 3},
+ {'category': 'technology', 'source': 'Engadget', 'url': 'https://www.engadget.com/rss.xml', 'weight': 3},
+ {'category': 'gaming', 'source': 'Polygon', 'url': 'https://www.polygon.com/rss/index.xml', 'weight': 4},
+ {'category': 'gaming', 'source': 'Kotaku', 'url': 'https://kotaku.com/rss', 'weight': 4},
+ {'category': 'gaming', 'source': 'IGN', 'url': 'https://feeds.feedburner.com/ign/all', 'weight': 4},
+ {'category': 'gaming', 'source': 'GameSpot', 'url': 'https://www.gamespot.com/feeds/mashup/', 'weight': 3},
+ {'category': 'anime',
+  'source': 'Anime News Network',
+  'url': 'https://www.animenewsnetwork.com/all/rss.xml',
+  'weight': 5},
+ {'category': 'anime', 'source': 'Crunchyroll News', 'url': 'https://www.crunchyroll.com/news/rss', 'weight': 4},
+ {'category': 'travel', 'source': 'BBC Travel', 'url': 'https://www.bbc.com/travel/feed.rss', 'weight': 4},
+ {'category': 'travel', 'source': 'Travel + Leisure', 'url': 'https://www.travelandleisure.com/feed', 'weight': 3},
+ {'category': 'travel', 'source': 'Lonely Planet', 'url': 'https://www.lonelyplanet.com/news/feed', 'weight': 3},
+ {'category': 'travel-business', 'source': 'Skift', 'url': 'https://skift.com/feed/', 'weight': 3},
+ {'category': 'markets',
+  'source': 'MarketWatch',
+  'url': 'https://feeds.marketwatch.com/marketwatch/topstories/',
+  'weight': 3},
+ {'category': 'finance', 'source': 'Yahoo Finance', 'url': 'https://finance.yahoo.com/news/rssindex', 'weight': 3}]
 
-# GDELT検索入口はこの2語だけ。
-SEARCH_TERMS = ["Japan", "Japanese"]
-
-# 102語。ランキング計算では先頭2語 Japan / Japanese を除外し、残り100語を使う。
-# 方針: China / AI / inflation / stock market などの汎用語は除外し、
-# 日本固有・日本文化・日本制度・日本企業・日本発IPに寄せる。
-JAPAN_SPECIFIC_SEED_102 = [
-    # 検索入口。ランキング計算からは除外。
-    "Japan",
-    "Japanese",
-
-    # 経済・金融・制度・政治・安全保障
-    "yen",
-    "Bank of Japan",
-    "BOJ",
-    "Nikkei",
-    "TOPIX",
-    "Tokyo Stock Exchange",
-    "JGB",
-    "LDP",
-    "Liberal Democratic Party",
-    "Japanese Diet",
-    "Self-Defense Forces",
-    "SDF",
-    "JSDF",
-    "Okinawa bases",
-    "Futenma",
-    "Senkaku",
-    "Northern Territories",
-    "Fukushima",
-
-    # 地名・観光地・地域名
-    "Tokyo",
-    "Osaka",
-    "Kyoto",
-    "Hokkaido",
-    "Okinawa",
-    "Mount Fuji",
-    "Shibuya",
-    "Shinjuku",
-    "Akihabara",
-    "Ginza",
-    "Hiroshima",
-    "Nagasaki",
-    "Noto Peninsula",
-    "Sapporo",
-    "Fukuoka",
-    "Nara",
-    "Kobe",
-    "Yokohama",
-
-    # 交通・旅行・生活文化
-    "Shinkansen",
-    "JR Pass",
-    "Japan Rail",
-    "Suica",
-    "onsen",
-    "ryokan",
-    "izakaya",
-    "konbini",
-
-    # 食文化
-    "sushi",
-    "ramen",
-    "udon",
-    "soba",
-    "tempura",
-    "wagyu",
-    "matcha",
-    "Japanese sake",
-    "nihonshu",
-    "shochu",
-    "bento",
-    "omakase",
-    "kaiseki",
-    "miso",
-    "natto",
-
-    # 伝統文化
-    "kimono",
-    "yukata",
-    "geisha",
-    "samurai",
-    "ninja",
-    "Shinto",
-    "torii",
-    "matsuri",
-    "hanami",
-    "sakura",
-    "cherry blossoms",
-    "kabuki",
-    "noh",
-    "sumo",
-
-    # ポップカルチャー・スポーツ・人物
-    "anime",
-    "manga",
-    "otaku",
-    "cosplay",
-    "VTuber",
-    "J-pop",
-    "seiyuu",
-    "Studio Ghibli",
-    "Pokemon",
-    "Godzilla",
-    "Gundam",
-    "Hello Kitty",
-    "One Piece",
-    "Demon Slayer",
-    "Dragon Ball",
-    "Shohei Ohtani",
-
-    # 日本企業・ブランド
-    "Toyota",
-    "Honda",
-    "Nissan",
-    "Sony",
-    "Nintendo",
-    "PlayStation",
-    "Nintendo Switch",
-    "SoftBank",
-    "Uniqlo",
-    "MUJI",
-    "Sanrio",
-]
-
-# 長さチェックはUI側で表示するだけにし、アプリ起動時に落とさない。
-# 仕様上は Japan / Japanese を含む102語、ランキング語は残り100語。
-RANKING_TERMS = JAPAN_SPECIFIC_SEED_102[2:]
-
-MAJOR_MEDIA_DOMAINS = {
-    "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "cnn.com",
-    "nytimes.com", "washingtonpost.com", "theguardian.com", "ft.com",
-    "bloomberg.com", "wsj.com", "cnbc.com", "forbes.com", "economist.com",
-    "politico.com", "axios.com", "npr.org", "aljazeera.com", "dw.com",
-    "france24.com", "lemonde.fr", "elpais.com", "scmp.com", "straitstimes.com",
-    "abc.net.au", "theglobeandmail.com", "cbc.ca",
+CATEGORY_BONUS = {
+    "anime": 8,
+    "gaming": 6,
+    "culture": 5,
+    "travel": 5,
+    "travel-business": 4,
+    "asia-pacific": 4,
+    "business": 3,
+    "business-tech": 3,
+    "markets": 3,
+    "finance": 3,
+    "technology": 3,
+    "tech": 3,
+    "entertainment": 3,
+    "world": 2,
+    "international": 2,
+    "top": 1,
+    "all": 1,
 }
 
-CATEGORY_TERMS = {
-    "経済・金融・制度": {
-        "yen", "bank of japan", "boj", "nikkei", "topix", "tokyo stock exchange", "jgb",
-        "japanese government bonds", "ldp", "liberal democratic party", "japanese diet",
-    },
-    "政治・安全保障": {
-        "self-defense forces", "sdf", "jsdf", "okinawa bases", "futenma", "senkaku",
-        "northern territories", "fukushima",
-    },
-    "地名・観光地": {
-        "tokyo", "osaka", "kyoto", "hokkaido", "okinawa", "mount fuji", "shibuya",
-        "shinjuku", "akihabara", "ginza", "hiroshima", "nagasaki", "noto peninsula",
-        "sapporo", "fukuoka", "nara", "kobe", "yokohama",
-    },
-    "交通・旅行・生活": {
-        "shinkansen", "bullet train", "jr pass", "japan rail", "suica", "onsen", "ryokan",
-        "izakaya", "konbini",
-    },
-    "食文化": {
-        "sushi", "ramen", "udon", "soba", "tempura", "wagyu", "matcha", "japanese sake",
-        "nihonshu", "shochu", "bento", "omakase", "kaiseki", "miso", "natto",
-    },
-    "伝統文化": {
-        "kimono", "yukata", "geisha", "samurai", "ninja", "shinto", "torii", "matsuri",
-        "hanami", "sakura", "cherry blossoms", "kabuki", "noh", "sumo",
-    },
-    "ポップカルチャー・スポーツ": {
-        "anime", "manga", "otaku", "cosplay", "vtuber", "j-pop", "idol", "seiyuu",
-        "studio ghibli", "pokemon", "godzilla", "gundam", "hello kitty", "one piece",
-        "demon slayer", "dragon ball", "shohei ohtani", "ohtani",
-    },
-    "企業・ブランド": {
-        "toyota", "honda", "nissan", "sony", "nintendo", "playstation", "nintendo switch",
-        "softbank", "uniqlo", "muji", "sanrio",
-    },
+NOISY_LOW_WEIGHT_TERMS = {
+    "sake": 0.25,       # for the sake of
+    "fuji": 0.5,        # names/products can collide
+    "ninja": 0.7,
+    "samurai": 0.7,
+    "diet": 0.6,        # National Diet vs food diet
+    "sharp": 0.6,
+    "canon": 0.6,
+    "temple": 0.8,
+    "shrine": 0.8,
+    "volcano": 0.8,
+    "earthquake": 0.8,
+    "typhoon": 0.8,
 }
 
+SCRIPT_BLOCK_RE = re.compile(
+    r"[぀-ヿ㐀-䶿一-鿿"
+    r"가-힯Ѐ-ӿ؀-ۿ"
+    r"฀-๿Ͱ-Ͽ]"
+)
 
-# ============================================================
-# GDELT取得
-# ============================================================
-
-def build_gdelt_query() -> str:
-    # GDELTは括弧をORグループにだけ使うのが安全。
-    return "(Japan OR Japanese) -sourcecountry:japan"
-
-
-@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
-def fetch_gdelt_articles(query: str, timespan: str, maxrecords: int, sort_mode: str, retry_count: int) -> Tuple[List[dict], str]:
-    """GDELT DOC 2.0 ArticleListを取得。エラー時は([], error_message)。"""
-    if maxrecords <= 0:
-        return [], "取得件数が0なのでGDELT取得をスキップしました。"
-
-    params = {
-        "query": query,
-        "mode": "ArtList",
-        "format": "json",
-        "timespan": timespan,
-        "maxrecords": int(maxrecords),
-        "sort": sort_mode,
-    }
-    headers = {"User-Agent": USER_AGENT}
-
-    last_error = ""
-    for attempt in range(max(1, retry_count + 1)):
-        try:
-            resp = requests.get(GDELT_ENDPOINT, params=params, headers=headers, timeout=30)
-            content_type = resp.headers.get("Content-Type", "")
-
-            if resp.status_code == 429:
-                retry_after = resp.headers.get("Retry-After")
-                if retry_after and str(retry_after).isdigit():
-                    wait_sec = min(float(retry_after), 90.0)
-                else:
-                    wait_sec = min(8.0 * (2 ** attempt) + random.random() * 2.0, 90.0)
-                last_error = (
-                    "HTTP 429 Too Many Requests: GDELTのレート制限に当たりました。"
-                    f"retry_after={retry_after}, next_wait_sec={wait_sec:.1f}, query={query}"
-                )
-                if attempt < retry_count:
-                    time.sleep(wait_sec)
-                    continue
-                return [], last_error
-
-            if resp.status_code >= 400:
-                body = resp.text[:500].replace("\n", " ")
-                return [], f"HTTP {resp.status_code}: {body}"
-
-            # GDELTは構文エラー時にstatus=200でtext/htmlを返すことがある。
-            if "json" not in content_type.lower():
-                body = resp.text[:500].replace("\n", " ")
-                return [], (
-                    "GDELTがJSON以外を返しました "
-                    f"status={resp.status_code}, content_type={content_type}, body={body}"
-                )
-
-            data = resp.json()
-            articles = data.get("articles", [])
-            if not isinstance(articles, list):
-                return [], "GDELTレスポンスのarticles形式が想定外です。"
-            return articles, ""
-
-        except requests.exceptions.RequestException as e:
-            wait_sec = min(4.0 * (2 ** attempt) + random.random(), 60.0)
-            last_error = f"RequestException: {type(e).__name__}: {e}"
-            if attempt < retry_count:
-                time.sleep(wait_sec)
-                continue
-            return [], last_error
-        except ValueError as e:
-            return [], f"JSON decode error: {e}"
-
-    return [], last_error or "unknown error"
+USER_AGENT = (
+    "Mozilla/5.0 (compatible; JapanBuzzRSSRanker/1.0; "
+    "+https://example.com/rss-japan-buzz-ranker)"
+)
 
 
-# ============================================================
-# スコアリング
-# ============================================================
+def is_probably_english_title(title: str) -> bool:
+    """Lightweight English-title filter without external language libraries."""
+    if not title:
+        return False
+    t = unicodedata.normalize("NFKC", title).strip()
+    if len(t) < 8:
+        return False
+    if SCRIPT_BLOCK_RE.search(t):
+        return False
+    letters = [ch for ch in t if ch.isalpha()]
+    if len(letters) < 4:
+        return False
+    ascii_letters = [ch for ch in letters if "a" <= ch.lower() <= "z"]
+    ascii_ratio = len(ascii_letters) / max(1, len(letters))
+    return ascii_ratio >= 0.85
 
-def canonical_domain(article: dict) -> str:
-    domain = str(article.get("domain", "") or "").lower().strip()
-    if domain:
-        return domain.replace("www.", "")
-    url = str(article.get("url", "") or "")
-    try:
-        return urlparse(url).netloc.lower().replace("www.", "")
-    except Exception:
+
+def clean_url_for_dedupe(url: str) -> str:
+    if not url:
         return ""
+    try:
+        parts = urlsplit(url.strip())
+        filtered_query = []
+        for k, v in parse_qsl(parts.query, keep_blank_values=True):
+            kl = k.lower()
+            if kl.startswith("utm_") or kl in {"fbclid", "gclid", "mc_cid", "mc_eid"}:
+                continue
+            filtered_query.append((k, v))
+        return urlunsplit((
+            parts.scheme.lower(),
+            parts.netloc.lower(),
+            parts.path.rstrip("/"),
+            urlencode(filtered_query),
+            "",
+        ))
+    except Exception:
+        return url.strip().lower()
 
 
-def is_major_media(domain: str) -> bool:
-    d = (domain or "").lower().replace("www.", "")
-    return any(d == m or d.endswith("." + m) for m in MAJOR_MEDIA_DOMAINS)
-
-
-def normalize_text_for_match(text: str) -> str:
-    text = html.unescape(unquote(str(text or ""))).lower()
-    # ハイフン/スラッシュ/アンダースコア/ドットを語区切りとして扱う。
-    text = re.sub(r"[\u2010-\u2015−–—/_.:;,+()\[\]{}|!?\"'`~@#$%^&*=<>]", " ", text)
+def normalize_for_matching(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text or "").lower()
+    # Keep a raw-ish version but make URL separators and punctuation searchable as spaces.
+    text = re.sub(r"[‐-―\-/_.:+|#?=&%]+", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
 
-def normalize_term_for_match(term: str) -> str:
-    return normalize_text_for_match(term)
+def term_pattern(term: str) -> re.Pattern:
+    t = normalize_for_matching(term)
+    # Allow spaces/hyphen-like separators between phrase parts.
+    escaped = re.escape(t).replace(r"\ ", r"[\s\-_/]+")
+    return re.compile(r"(?<![a-z0-9])" + escaped + r"(?![a-z0-9])", re.IGNORECASE)
 
 
-def build_metadata_text(article: dict) -> str:
-    """タイトル・URL・GDELTメタデータを結合。本文全文は取得しない。"""
-    keys = [
-        "title",
-        "url",
-        "url_mobile",
-        "domain",
-        "language",
-        "sourcecountry",
-        "seendate",
-        "socialimage",
+@st.cache_resource(show_spinner=False)
+def compiled_term_patterns() -> list[tuple[str, re.Pattern]]:
+    return [(term, term_pattern(term)) for term in JAPAN_SPECIFIC_TERMS_300]
+
+
+def parse_entry_datetime(entry: Any) -> datetime | None:
+    for key in ("published_parsed", "updated_parsed", "created_parsed"):
+        parsed = entry.get(key)
+        if parsed:
+            try:
+                return datetime.fromtimestamp(calendar.timegm(parsed), tz=timezone.utc)
+            except Exception:
+                pass
+    return None
+
+
+def entry_tags_text(entry: Any) -> str:
+    tags = []
+    for tag in entry.get("tags", []) or []:
+        term = tag.get("term") if isinstance(tag, dict) else None
+        if term:
+            tags.append(str(term))
+    return " ".join(tags)
+
+
+def build_scoring_text(item: dict[str, Any], include_summary_for_scoring: bool) -> str:
+    parts = [
+        item.get("title", ""),
+        item.get("link", ""),
+        item.get("source", ""),
+        item.get("feed_category", ""),
+        item.get("feed_title", ""),
+        item.get("tags", ""),
     ]
-    fields = [article.get(k, "") for k in keys]
-
-    # その他のスカラーなGDELTメタデータも薄く含める。
-    for k, v in article.items():
-        if k in keys:
-            continue
-        if isinstance(v, (str, int, float)):
-            fields.append(str(v))
-
-    return normalize_text_for_match(" ".join(str(x) for x in fields if x))
+    if include_summary_for_scoring:
+        # Used only internally for scoring; not displayed as article content.
+        parts.append(item.get("summary", ""))
+    return normalize_for_matching(" ".join(str(x) for x in parts if x))
 
 
-@st.cache_data(show_spinner=False)
-def compiled_term_patterns(terms: Tuple[str, ...]) -> Dict[str, re.Pattern]:
-    patterns = {}
-    for term in terms:
-        norm = normalize_term_for_match(term)
-        if not norm:
-            continue
-        # normalize済みテキストに対し、語境界つきでカウント。
-        # 複数語フレーズもスペース区切りで一致。
-        pattern = r"(?<![a-z0-9])" + re.escape(norm) + r"(?![a-z0-9])"
-        patterns[term] = re.compile(pattern, flags=re.IGNORECASE)
-    return patterns
-
-
-def score_article(article: dict, terms: List[str]) -> dict:
-    text = build_metadata_text(article)
-    patterns = compiled_term_patterns(tuple(terms))
-
+def count_japan_terms(item: dict[str, Any], include_summary_for_scoring: bool) -> dict[str, Any]:
+    text = build_scoring_text(item, include_summary_for_scoring)
     total_hits = 0
-    matched_terms = []
-    term_counts = {}
+    weighted_hits = 0.0
+    matched_terms: list[str] = []
+    term_counts: dict[str, int] = {}
 
-    for term, pattern in patterns.items():
-        count = len(pattern.findall(text))
-        if count > 0:
-            total_hits += count
-            matched_terms.append(term)
-            term_counts[term] = count
+    for term, pat in compiled_term_patterns():
+        n = len(pat.findall(text))
+        if n <= 0:
+            continue
+        total_hits += n
+        weight = NOISY_LOW_WEIGHT_TERMS.get(term.lower(), 1.0)
+        weighted_hits += n * weight
+        matched_terms.append(term)
+        term_counts[term] = n
 
-    domain = canonical_domain(article)
-    major = is_major_media(domain)
-
-    # ユーザー指定の主ランキングは「出現回数」。
-    # major_media等は同点時の補助にだけ使う。
     return {
-        "score": int(total_hits),
-        "unique_hits": int(len(matched_terms)),
+        "term_total_hits": total_hits,
+        "term_weighted_hits": weighted_hits,
+        "unique_term_hits": len(matched_terms),
         "matched_terms": matched_terms,
         "term_counts": term_counts,
-        "domain": domain,
-        "is_major_media": major,
     }
 
 
-def detect_category(matched_terms: List[str]) -> str:
-    if not matched_terms:
-        return "未分類"
-    lowered = {normalize_term_for_match(t) for t in matched_terms}
-    scores = {}
-    for category, terms in CATEGORY_TERMS.items():
-        scores[category] = len(lowered & terms)
-    best_category, best_score = max(scores.items(), key=lambda x: x[1])
-    return best_category if best_score > 0 else "未分類"
+@st.cache_data(ttl=900, show_spinner=False)
+def fetch_feed(url: str, timeout_sec: int) -> tuple[dict[str, Any] | None, str | None]:
+    try:
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout_sec)
+        if resp.status_code >= 400:
+            return None, f"HTTP {resp.status_code}"
+        parsed = feedparser.parse(resp.content)
+        if getattr(parsed, "bozo", False):
+            # Feedparser bozo can be non-fatal, so keep parsed entries if any.
+            if not parsed.entries:
+                return None, f"parse error: {getattr(parsed, 'bozo_exception', '')}"
+        return parsed, None
+    except Exception as e:
+        return None, repr(e)
 
 
-def rank_articles(articles: List[dict], max_rank: int = 30) -> pd.DataFrame:
-    rows = []
-    seen_urls = set()
+def recency_bonus(published_dt: datetime | None, now: datetime, lookback_hours: int) -> float:
+    if published_dt is None:
+        return 0.0
+    age_h = max(0.0, (now - published_dt).total_seconds() / 3600)
+    if age_h > lookback_hours:
+        return 0.0
+    # 0-6 points. Fresh items get more.
+    return max(0.0, 6.0 * (1.0 - age_h / max(1, lookback_hours)))
 
-    for article in articles:
-        url = str(article.get("url", "") or "").strip()
-        if not url or url in seen_urls:
+
+def feed_position_bonus(position: int) -> float:
+    # Top of a feed usually means editorial importance.
+    return max(0.0, 10.0 - min(position, 10))
+
+
+def build_item_from_entry(feed_cfg: dict[str, Any], feed_title: str, entry: Any, position: int) -> dict[str, Any]:
+    published_dt = parse_entry_datetime(entry)
+    link = entry.get("link", "") or ""
+    summary = entry.get("summary", "") or entry.get("description", "") or ""
+    return {
+        "source": feed_cfg["source"],
+        "feed_category": feed_cfg["category"],
+        "feed_url": feed_cfg["url"],
+        "source_weight": float(feed_cfg.get("weight", 1)),
+        "feed_title": feed_title,
+        "feed_position": int(position),
+        "title": (entry.get("title", "") or "").strip(),
+        "link": link,
+        "dedupe_url": clean_url_for_dedupe(link),
+        "summary": re.sub(r"\s+", " ", summary).strip(),
+        "tags": entry_tags_text(entry),
+        "published_dt": published_dt,
+        "published": published_dt.isoformat() if published_dt else "",
+    }
+
+
+def collect_and_rank(
+    selected_sources: list[str],
+    selected_categories: list[str],
+    lookback_hours: int,
+    max_entries_per_feed: int,
+    request_interval_sec: float,
+    timeout_sec: int,
+    include_undated: bool,
+    include_summary_for_scoring: bool,
+    min_unique_terms: int,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    now = datetime.now(timezone.utc)
+    cutoff = now - timedelta(hours=lookback_hours)
+    rows: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    seen_keys: set[str] = set()
+
+    feeds = [f for f in RSS_FEEDS if f["source"] in selected_sources and f["category"] in selected_categories]
+
+    progress = st.progress(0, text="RSSを巡回中...") if feeds else None
+    total_feeds = max(1, len(feeds))
+
+    for feed_i, cfg in enumerate(feeds):
+        if request_interval_sec > 0 and feed_i > 0:
+            time.sleep(request_interval_sec)
+
+        parsed, err = fetch_feed(cfg["url"], timeout_sec=timeout_sec)
+        if err:
+            errors.append({"source": cfg["source"], "category": cfg["category"], "url": cfg["url"], "error": err})
+            if progress:
+                progress.progress((feed_i + 1) / total_feeds, text=f"RSS巡回中... {feed_i + 1}/{len(feeds)}")
             continue
-        seen_urls.add(url)
 
-        s = score_article(article, RANKING_TERMS)
-        if s["score"] <= 0:
-            continue
+        feed_title = ""
+        try:
+            feed_title = parsed.feed.get("title", "") if parsed and hasattr(parsed, "feed") else ""
+        except Exception:
+            feed_title = ""
 
-        matched_terms = s["matched_terms"]
-        term_counts = s["term_counts"]
-        top_terms = sorted(term_counts.items(), key=lambda x: (-x[1], x[0].lower()))
-        top_terms_text = ", ".join([f"{k}({v})" for k, v in top_terms[:12]])
+        entries = list(parsed.entries or [])[:max_entries_per_feed]
+        for pos, entry in enumerate(entries):
+            item = build_item_from_entry(cfg, feed_title, entry, pos)
+            title = item["title"]
+            if not is_probably_english_title(title):
+                continue
 
-        seendate = str(article.get("seendate", "") or "")
-        rows.append({
-            "score": s["score"],
-            "unique_hits": s["unique_hits"],
-            "category": detect_category(matched_terms),
-            "matched_terms": top_terms_text,
-            "title": str(article.get("title", "") or ""),
-            "domain": s["domain"],
-            "sourcecountry": str(article.get("sourcecountry", "") or ""),
-            "language": str(article.get("language", "") or ""),
-            "seendate": seendate,
-            "is_major_media": s["is_major_media"],
-            "url": url,
-        })
+            published_dt = item["published_dt"]
+            if published_dt is None:
+                if not include_undated:
+                    continue
+            elif published_dt < cutoff or published_dt > now + timedelta(hours=2):
+                continue
 
-    if not rows:
-        return pd.DataFrame(columns=[
-            "rank", "score", "unique_hits", "category", "matched_terms", "title", "domain",
-            "sourcecountry", "language", "seendate", "is_major_media", "url"
-        ])
+            dedupe_key = item["dedupe_url"] or normalize_for_matching(title)
+            if not dedupe_key or dedupe_key in seen_keys:
+                continue
+            seen_keys.add(dedupe_key)
+
+            hit = count_japan_terms(item, include_summary_for_scoring)
+            if hit["unique_term_hits"] < min_unique_terms or hit["term_total_hits"] <= 0:
+                continue
+
+            cat_bonus = CATEGORY_BONUS.get(str(cfg["category"]).lower(), 0)
+            r_bonus = recency_bonus(published_dt, now, lookback_hours)
+            p_bonus = feed_position_bonus(pos)
+            source_weight = float(cfg.get("weight", 1))
+
+            # Main objective: Japan-specific term density, plus RSS editorial prominence.
+            score = (
+                3.0 * hit["term_weighted_hits"]
+                + 5.0 * hit["unique_term_hits"]
+                + 1.0 * source_weight
+                + 0.8 * cat_bonus
+                + 0.7 * p_bonus
+                + 0.8 * r_bonus
+            )
+
+            rows.append({
+                "score": round(score, 2),
+                "term_total_hits": hit["term_total_hits"],
+                "unique_term_hits": hit["unique_term_hits"],
+                "matched_terms": ", ".join(hit["matched_terms"][:18]),
+                "title": title,
+                "source": item["source"],
+                "category": item["feed_category"],
+                "published": item["published"],
+                "feed_position": item["feed_position"] + 1,
+                "source_weight": source_weight,
+                "url": item["link"],
+            })
+
+        if progress:
+            progress.progress((feed_i + 1) / total_feeds, text=f"RSS巡回中... {feed_i + 1}/{len(feeds)}")
+
+    if progress:
+        progress.empty()
 
     df = pd.DataFrame(rows)
-    df = df.sort_values(
-        by=["score", "unique_hits", "is_major_media", "seendate"],
-        ascending=[False, False, False, False],
-        kind="mergesort",
-    ).head(max_rank).reset_index(drop=True)
-    df.insert(0, "rank", range(1, len(df) + 1))
-    return df
+    if not df.empty:
+        df = df.sort_values(
+            by=["score", "term_total_hits", "unique_term_hits", "published"],
+            ascending=[False, False, False, False],
+        ).head(MAX_RANKING).reset_index(drop=True)
+        df.insert(0, "rank", range(1, len(df) + 1))
+
+    err_df = pd.DataFrame(errors)
+    return df, err_df
 
 
-def summarize_terms(df: pd.DataFrame) -> pd.DataFrame:
-    counter = {}
-    if df.empty:
-        return pd.DataFrame(columns=["term", "count"])
-    for text in df["matched_terms"].fillna(""):
-        for part in str(text).split(","):
-            part = part.strip()
-            if not part:
-                continue
-            m = re.match(r"^(.*)\((\d+)\)$", part)
-            if not m:
-                continue
-            term = m.group(1).strip()
-            count = int(m.group(2))
-            counter[term] = counter.get(term, 0) + count
-    return pd.DataFrame(
-        [{"term": k, "count": v} for k, v in sorted(counter.items(), key=lambda x: (-x[1], x[0].lower()))]
+def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
+    return df.to_csv(index=False, quoting=csv.QUOTE_MINIMAL).encode("utf-8-sig")
+
+
+def render_result_cards(df: pd.DataFrame) -> None:
+    for _, row in df.iterrows():
+        st.markdown(f"### {int(row['rank'])}. [{row['title']}]({row['url']})")
+        st.caption(
+            f"score={row['score']} | hits={row['term_total_hits']} | "
+            f"unique={row['unique_term_hits']} | {row['source']} / {row['category']} | "
+            f"feed position={row['feed_position']} | {row['published'] or 'date unknown'}"
+        )
+        st.write("**Matched terms:** " + str(row["matched_terms"]))
+        st.divider()
+
+
+def main() -> None:
+    st.set_page_config(page_title="海外日本バズRSSランキング", layout="wide")
+    st.title("海外日本バズRSSランキング")
+    st.caption(
+        "海外RSSの英語タイトル記事だけを巡回し、日本特有300語がタイトル・URL・RSSメタデータに多く出る記事を上位30件で表示します。"
     )
 
+    with st.sidebar:
+        st.header("設定")
+        st.caption(f"app version: {APP_VERSION}")
 
-# ============================================================
-# Streamlit UI
-# ============================================================
+        lookback_hours = st.slider(
+            "周回対象期間（直近何時間の記事を見るか）",
+            min_value=1,
+            max_value=24 * 14,
+            value=72,
+            step=1,
+        )
+        max_entries_per_feed = st.slider("RSSごとの最大取得件数", 0, 100, 40, 5)
+        request_interval_sec = st.slider("RSSアクセス間隔 秒", 0.0, 5.0, 0.2, 0.1)
+        timeout_sec = st.slider("RSSタイムアウト 秒", 3, 30, 12, 1)
+        include_undated = st.checkbox("日付不明の記事も含める", value=False)
+        include_summary_for_scoring = st.checkbox(
+            "RSS summary/description もスコア計算に使う（本文取得はしない）",
+            value=True,
+        )
+        min_unique_terms = st.slider("最低ユニーク命中語数", 1, 5, 1, 1)
 
-st.set_page_config(
-    page_title="海外日本バズ検出ランキング",
-    page_icon="🗞️",
-    layout="wide",
-)
+        sources = sorted({f["source"] for f in RSS_FEEDS})
+        categories = sorted({f["category"] for f in RSS_FEEDS})
+        selected_sources = st.multiselect("巡回する媒体", sources, default=sources)
+        selected_categories = st.multiselect("巡回するカテゴリ", categories, default=categories)
 
-st.title("海外日本バズ検出ランキング")
-st.caption(
-    "GDELTで Japan / Japanese を含む海外ニュースを1回だけ取得し、"
-    "タイトル・URL・GDELTメタデータ中の日本特有100語ヒット数でランキング化します。"
-)
+        st.markdown("---")
+        st.caption(
+            "除外済み: Guardian / Washington Post / Le Monde / Google News RSS / Reuters RSS。"
+        )
+        run = st.button("RSSを巡回してランキング作成", type="primary")
 
-with st.sidebar:
-    st.header("検索設定")
-    timespan_hours = st.slider(
-        "対象期間（時間）",
-        min_value=1,
-        max_value=168,
-        value=24,
-        step=1,
-        help="GDELTのtimespanに使います。24hなら直近24時間。",
+    st.info(
+        "表示するのはタイトル・媒体・日時・URL・命中語・独自スコアのみです。記事本文や画像は取得・転載しません。"
     )
-    maxrecords = st.slider(
-        "GDELT取得件数",
-        min_value=0,
-        max_value=250,
-        value=150,
-        step=10,
-        help="0にすると取得をスキップします。GDELT DOC APIのArticleListは通常250件程度までが扱いやすいです。",
-    )
-    ranking_max = st.slider(
-        "ランキング最大数",
-        min_value=1,
-        max_value=30,
-        value=30,
-        step=1,
-    )
-    sort_mode = st.selectbox(
-        "GDELT取得順",
-        options=["hybridrel", "datedesc"],
-        index=0,
-        help="hybridrelは関連度と新しさの混合、datedescは新しい順です。",
-    )
-    access_interval = st.slider(
-        "取得前の待機秒",
-        min_value=0.0,
-        max_value=10.0,
-        value=0.0,
-        step=0.1,
-        help="1回取得だけなので通常0でOK。429が出る環境では少し上げてください。",
-    )
-    retry_count = st.slider(
-        "429/通信エラー時のリトライ回数",
-        min_value=0,
-        max_value=3,
-        value=1,
-        step=1,
-    )
-    run_search = st.button("検索・ランキング作成", type="primary")
 
-    st.divider()
-    st.caption(f"APP_VERSION: {APP_VERSION}")
+    if not run:
+        st.subheader("仕様")
+        st.write(
+            f"登録RSS: {len(RSS_FEEDS)}本 / 日本特有語: {len(JAPAN_SPECIFIC_TERMS_300)}語 / ランキング上限: {MAX_RANKING}件"
+        )
+        st.write("サイドバーで期間・媒体・カテゴリを指定して実行してください。")
+        with st.expander("日本特有語300語を見る"):
+            st.write(", ".join(JAPAN_SPECIFIC_TERMS_300))
+        return
 
-query = build_gdelt_query()
-timespan = f"{timespan_hours}h"
+    if max_entries_per_feed <= 0:
+        st.warning("RSSごとの最大取得件数が0なので、取得対象がありません。")
+        return
+    if not selected_sources or not selected_categories:
+        st.warning("媒体またはカテゴリが未選択です。")
+        return
 
-st.subheader("検索クエリ")
-st.code(query, language="text")
-
-with st.expander("日本特有102語リストを見る"):
-    st.write("ランキング計算では Japan / Japanese を除外し、残り100語だけをカウントします。")
-    seed_df = pd.DataFrame({
-        "index": range(1, len(JAPAN_SPECIFIC_SEED_102) + 1),
-        "term": JAPAN_SPECIFIC_SEED_102,
-        "used_for_ranking": [False, False] + [True] * 100,
-    })
-    st.dataframe(seed_df, use_container_width=True, hide_index=True)
-
-if run_search:
-    if access_interval > 0:
-        time.sleep(access_interval)
-
-    with st.spinner("GDELTから海外ニュースを取得しています..."):
-        articles, error = fetch_gdelt_articles(
-            query=query,
-            timespan=timespan,
-            maxrecords=maxrecords,
-            sort_mode=sort_mode,
-            retry_count=retry_count,
+    with st.spinner("RSSを巡回してランキングを作成しています..."):
+        df, err_df = collect_and_rank(
+            selected_sources=selected_sources,
+            selected_categories=selected_categories,
+            lookback_hours=lookback_hours,
+            max_entries_per_feed=max_entries_per_feed,
+            request_interval_sec=request_interval_sec,
+            timeout_sec=timeout_sec,
+            include_undated=include_undated,
+            include_summary_for_scoring=include_summary_for_scoring,
+            min_unique_terms=min_unique_terms,
         )
 
-    if error:
-        st.warning(error)
-
-    st.subheader("取得結果")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("GDELT取得記事数", len(articles))
-    c2.metric("ランキング語数", len(RANKING_TERMS))
-    c3.metric("ランキング最大数", ranking_max)
-    c4.metric("対象期間", timespan)
-
-    if articles:
-        ranked_df = rank_articles(articles, max_rank=ranking_max)
-
-        st.subheader("ランキング")
-        if ranked_df.empty:
-            st.info("取得記事はありましたが、日本特有100語にヒットした記事がありませんでした。取得件数や対象期間を増やしてください。")
-        else:
-            display_df = ranked_df.copy()
-            st.dataframe(
-                display_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "url": st.column_config.LinkColumn("url"),
-                    "score": st.column_config.NumberColumn("score", help="日本特有100語の総出現回数"),
-                    "unique_hits": st.column_config.NumberColumn("unique_hits", help="ヒットした語の種類数"),
-                    "is_major_media": st.column_config.CheckboxColumn("major"),
-                },
-            )
-
-            csv = ranked_df.to_csv(index=False).encode("utf-8-sig")
-            st.download_button(
-                "ランキングCSVをダウンロード",
-                data=csv,
-                file_name="overseas_japan_term_ranking.csv",
-                mime="text/csv",
-            )
-
-            st.subheader("ランキング上位内のヒット語集計")
-            term_summary = summarize_terms(ranked_df)
-            if not term_summary.empty:
-                st.dataframe(term_summary.head(50), use_container_width=True, hide_index=True)
-
-            st.subheader("上位記事カード")
-            for _, row in ranked_df.head(10).iterrows():
-                with st.container(border=True):
-                    st.markdown(f"**#{int(row['rank'])}｜score {int(row['score'])}｜{row['category']}**")
-                    st.markdown(f"[{row['title']}]({row['url']})")
-                    st.caption(
-                        f"{row['domain']} / {row['sourcecountry']} / {row['language']} / {row['seendate']}"
-                    )
-                    st.write(f"命中語: {row['matched_terms']}")
+    st.subheader("ランキング")
+    if df.empty:
+        st.warning("条件に合う記事が見つかりませんでした。期間を長くする、取得件数を増やす、媒体カテゴリを増やすなどを試してください。")
     else:
-        st.info("記事が取得されませんでした。取得件数が0でないか、対象期間が短すぎないか確認してください。")
-else:
-    st.info("左サイドバーの『検索・ランキング作成』を押すと取得を開始します。")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("表示件数", len(df))
+        c2.metric("最高スコア", float(df["score"].max()))
+        c3.metric("対象期間", f"直近{lookback_hours}時間")
 
-st.divider()
-st.caption(
-    "データ出典: GDELT Project DOC 2.0 API。"
-    "本アプリは記事本文全文を取得せず、GDELTが返すタイトル・URL・メタデータをもとに独自集計します。"
-    "記事本文・画像・見出し等の権利は各配信元に帰属します。"
-)
+        st.download_button(
+            "ランキングCSVをダウンロード",
+            data=df_to_csv_bytes(df),
+            file_name="rss_japan_buzz_ranking.csv",
+            mime="text/csv",
+        )
+
+        display_cols = [
+            "rank",
+            "score",
+            "term_total_hits",
+            "unique_term_hits",
+            "matched_terms",
+            "title",
+            "source",
+            "category",
+            "published",
+            "url",
+        ]
+        st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
+
+        st.markdown("---")
+        st.subheader("リンク付き表示")
+        render_result_cards(df)
+
+    if not err_df.empty:
+        with st.expander(f"取得エラー・失敗RSS（{len(err_df)}件）"):
+            st.dataframe(err_df, use_container_width=True, hide_index=True)
+
+
+if __name__ == "__main__":
+    main()
