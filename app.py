@@ -16,38 +16,49 @@ import streamlit as st
 # 基本設定
 # ============================================================
 
-APP_VERSION = "2026-06-17-chunked-gdelt-safe"
+APP_VERSION = "2026-06-17-fixed10-zero-interval"
 GDELT_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
 CACHE_TTL_SECONDS = 60 * 30
 USER_AGENT = "overseas-japan-news-streamlit/1.1"
 
-# 企業名・特定作品名・個人名を含まない固定50語
+# 企業名・特定作品名・個人名を含まない固定10語
+# 目的: まず広く日本関連ニュースを拾い、詳細な固有名詞はバズワード自動抽出で補う。
 FIXED_KEYWORDS_50 = [
-    "Japan", "Japanese", "Tokyo", "Kyoto", "Osaka", "Hokkaido", "Okinawa",
-    "yen", "Bank of Japan", "Japanese economy", "inflation", "interest rates",
-    "stock market", "Nikkei", "tourism", "travel", "overtourism", "culture",
-    "tradition", "anime", "manga", "video games", "J-pop", "film", "drama",
-    "celebrity", "music", "fashion", "food", "sushi", "ramen", "matcha",
-    "sake", "onsen", "shrine", "temple", "samurai", "ninja", "earthquake",
-    "typhoon", "volcano", "heatwave", "politics", "election", "prime minister",
-    "defense", "military", "demographics", "aging population", "birth rate",
+    "Japan",
+    "Japanese",
+    "Tokyo",
+    "yen",
+    "Bank of Japan",
+    "Japanese economy",
+    "tourism",
+    "anime",
+    "manga",
+    "video games",
 ]
 
 FIXED_KEYWORDS_JA_50 = [
-    "日本", "日本人", "東京", "京都", "大阪", "北海道", "沖縄", "円", "日銀",
-    "日本経済", "インフレ", "金利", "株式市場", "日経平均", "観光", "旅行",
-    "オーバーツーリズム", "文化", "伝統", "アニメ", "漫画", "ゲーム", "J-POP",
-    "映画", "ドラマ", "芸能", "音楽", "ファッション", "食", "寿司", "ラーメン",
-    "抹茶", "日本酒", "温泉", "神社", "寺", "侍", "忍者", "地震", "台風",
-    "火山", "猛暑", "政治", "選挙", "首相", "防衛", "軍事", "人口", "高齢化", "出生率",
+    "日本",
+    "日本人",
+    "東京",
+    "円",
+    "日銀",
+    "日本経済",
+    "観光",
+    "アニメ",
+    "漫画",
+    "ゲーム",
 ]
 
 # これらは単独でも日本関連性が強いのでそのまま検索する
 STANDALONE_TERMS = {
-    "japan", "japanese", "tokyo", "kyoto", "osaka", "hokkaido", "okinawa",
-    "yen", "bank of japan", "japanese economy", "nikkei", "anime", "manga",
-    "j-pop", "sushi", "ramen", "matcha", "sake", "onsen", "shrine", "temple",
-    "samurai", "ninja",
+    "japan",
+    "japanese",
+    "tokyo",
+    "yen",
+    "bank of japan",
+    "japanese economy",
+    "anime",
+    "manga",
 }
 
 MAJOR_MEDIA_DOMAINS = {
@@ -588,7 +599,7 @@ def collect_news(timespan: str, maxrecords_fixed: int, maxrecords_buzz: int, max
     all_rows = []
     query_log = []
 
-    # 英語固定50語を小分けにして、海外・国内の両方を検索
+    # 英語固定10語を小分けにして、海外・国内の両方を検索
     for i, chunk in enumerate(chunk_list(FIXED_KEYWORDS_50, fixed_chunk_size), start=1):
         q_over = build_fixed_chunk_query_en(chunk, domestic=False)
         label_over = f"fixed_overseas_chunk_{i}"
@@ -612,7 +623,7 @@ def collect_news(timespan: str, maxrecords_fixed: int, maxrecords_buzz: int, max
 
         polite_sleep(sleep_sec)
 
-    # 日本語固定50語はGDELT側で不安定なことがあるため、任意ONにする
+    # 日本語固定10語はGDELT側で不安定なことがあるため、任意ONにする
     if include_japanese_domestic_terms:
         for i, chunk in enumerate(chunk_list(FIXED_KEYWORDS_JA_50, fixed_chunk_size), start=1):
             q_ja = build_fixed_chunk_query_ja(chunk)
@@ -673,7 +684,7 @@ def collect_news(timespan: str, maxrecords_fixed: int, maxrecords_buzz: int, max
 
 st.set_page_config(page_title="海外で相対的に注目される日本ニュース", page_icon="🌏", layout="wide")
 st.title("🌏 海外で相対的に注目される日本ニュース")
-st.caption("固定50ワード + バズワード自動抽出で、海外メディアでは目立つが日本国内メディアでは相対的に小さい話題をランキング化します。")
+st.caption("固定10ワード + バズワード自動抽出で、海外メディアでは目立つが日本国内メディアでは相対的に小さい話題をランキング化します。")
 
 with st.sidebar:
     st.header("設定")
@@ -687,14 +698,14 @@ with st.sidebar:
             maxrecords_fixed = st.slider("固定クエリ1本あたり最大取得件数", 20, 150, 60, 10)
             maxrecords_buzz = st.slider("バズワード1件あたり最大取得件数", 10, 80, 30, 10)
             max_buzzword_queries = st.slider("追加検索するバズワード数", 0, 6, 2, 1)
-            sleep_sec = st.slider("GDELTアクセス間隔 秒", 2.0, 12.0, 5.0, 0.5)
-            fixed_chunk_size = st.slider("固定語の分割サイズ", 4, 12, 8, 1)
+            sleep_sec = st.slider("GDELTアクセス間隔 秒（0秒以上）", 0.0, 12.0, 3.0, 0.5)
+            fixed_chunk_size = st.slider("固定語の分割サイズ", 1, 10, 10, 1)
         else:
             maxrecords_fixed = st.slider("固定クエリ1本あたり最大取得件数", 20, 250, 100, 10)
             maxrecords_buzz = st.slider("バズワード1件あたり最大取得件数", 10, 120, 50, 10)
             max_buzzword_queries = st.slider("追加検索するバズワード数", 0, 10, 4, 1)
-            sleep_sec = st.slider("GDELTアクセス間隔 秒", 2.0, 15.0, 4.0, 0.5)
-            fixed_chunk_size = st.slider("固定語の分割サイズ", 4, 15, 10, 1)
+            sleep_sec = st.slider("GDELTアクセス間隔 秒（0秒以上）", 0.0, 15.0, 2.0, 0.5)
+            fixed_chunk_size = st.slider("固定語の分割サイズ", 1, 10, 10, 1)
 
         domestic_penalty_alpha = st.slider("国内注目度の減点係数", 0.0, 1.5, 0.7, 0.05)
         min_score = st.slider("表示する最低スコア", -30.0, 50.0, -5.0, 1.0)
@@ -702,7 +713,7 @@ with st.sidebar:
         domestic_ratio_limit = st.slider("国内記事数 / 海外記事数 の除外倍率", 1.0, 10.0, 3.0, 0.5)
 
         include_japanese_domestic_terms = st.checkbox(
-            "国内検索に日本語50ワードも使う",
+            "国内検索に日本語10ワードも使う",
             value=False,
             help="GDELTが日本語クエリで不安定になる場合があるため、まずはOFF推奨です。",
         )
