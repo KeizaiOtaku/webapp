@@ -5,6 +5,7 @@
 # - Ranks English RSS items by Japan-specific 1000-term hits in title / URL / metadata
 # - Repeated hits of the same term use geometric decay: 1.0, 0.5, 0.25, ...
 # - Before global ranking, items in the same RSS category are also decayed: 1st=1.0, 2nd=0.5, 3rd=0.25, ...
+# - Japan/Japanese are not terms, but add a capped +0.5 anchor bonus if present in title/URL/RSS metadata
 
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "2026-06-17-rss-japan-buzz-top1000-no-neet-title-translate"
+APP_VERSION = "2026-06-17-rss-japan-buzz-top1000-japan-anchor-bonus"
 DEFAULT_RANKING_LIMIT = 30
 MAX_RANKING_LIMIT = 100
 
@@ -1210,9 +1211,13 @@ def is_blocked_term(term: str) -> bool:
         return True
     if any(bad in compact for bad in BLOCKED_SUBSTRINGS_COMPACT):
         return True
-    # Block exact tokens only for short acronyms like MOD. This does not block words like "module".
+    # Block only explicitly forbidden standalone short tokens.
+    # Do not compare every token against the broad exact blocklist; otherwise
+    # valid Japan-specific phrases such as "National Diet" get removed because
+    # they contain the generic blocked token "diet".
+    BLOCKED_TOKEN_TERMS = {"mod", "neet"}
     tokens = set(re.findall(r"[a-z0-9]+", norm))
-    if tokens & BLOCKED_EXACT_NORMALIZED_TERMS:
+    if tokens & BLOCKED_TOKEN_TERMS:
         return True
     return False
 
@@ -1544,6 +1549,26 @@ def count_japan_terms(item: dict[str, Any], include_summary_for_scoring: bool) -
         "category_counts": category_counts,
     }
 
+
+JAPAN_ANCHOR_PATTERN = re.compile(r"(?<![a-z0-9])(?:japan|japanese)(?![a-z0-9])", re.IGNORECASE)
+
+
+def count_japan_anchor_bonus(item: dict[str, Any]) -> dict[str, Any]:
+    """Return a small capped bonus when Japan/Japanese appears outside the 1000 terms.
+
+    Japan/Japanese are intentionally not part of the Japan-specific term list.
+    If either appears in title / URL / RSS metadata, the article receives +0.5 at most.
+    The two words are counted jointly, so repeated appearances do not increase the bonus.
+    Summary/body text is intentionally excluded from this anchor bonus.
+    """
+    text = build_scoring_text(item, include_summary_for_scoring=False)
+    found = bool(JAPAN_ANCHOR_PATTERN.search(text))
+    return {
+        "japan_anchor_hit": int(found),
+        "japan_anchor_bonus": 0.5 if found else 0.0,
+    }
+
+
 def xml_text(parent: ET.Element | None, names: list[str]) -> str:
     if parent is None:
         return ""
@@ -1743,7 +1768,11 @@ def collect_and_rank(
             seen_keys.add(dedupe_key)
 
             hit = count_japan_terms(item, include_summary_for_scoring)
-            if hit["unique_term_hits"] < min_unique_terms or hit["term_total_hits"] <= 0:
+            anchor = count_japan_anchor_bonus(item)
+
+            has_japan_terms = hit["term_total_hits"] > 0 and hit["unique_term_hits"] >= min_unique_terms
+            has_anchor_only_candidate = anchor["japan_anchor_hit"] == 1
+            if not has_japan_terms and not has_anchor_only_candidate:
                 continue
 
             cat_bonus = CATEGORY_BONUS.get(str(cfg["category"]).lower(), 0)
@@ -1751,15 +1780,23 @@ def collect_and_rank(
             p_bonus = feed_position_bonus(pos)
             source_weight = float(cfg.get("weight", 1))
 
-            # Main objective: Japan-specific term density, plus RSS editorial prominence.
-            score = (
-                3.0 * hit["term_weighted_hits"]
-                + 5.0 * hit["unique_term_hits"]
-                + 1.0 * source_weight
-                + 0.8 * cat_bonus
-                + 0.7 * p_bonus
-                + 0.8 * r_bonus
-            )
+            if has_japan_terms:
+                # Main objective: Japan-specific term density, plus capped Japan/Japanese anchor bonus and RSS editorial prominence.
+                score = (
+                    3.0 * hit["term_weighted_hits"]
+                    + 5.0 * hit["unique_term_hits"]
+                    + anchor["japan_anchor_bonus"]
+                    + 1.0 * source_weight
+                    + 0.8 * cat_bonus
+                    + 0.7 * p_bonus
+                    + 0.8 * r_bonus
+                )
+                anchor_only = 0
+            else:
+                # If Japan/Japanese is the only Japan-related signal, keep it visible but intentionally weak.
+                # Source/category/position/recency bonuses are not added here, so anchor-only articles do not dominate.
+                score = anchor["japan_anchor_bonus"]  # capped at 0.5 by count_japan_anchor_bonus()
+                anchor_only = 1
 
             rows.append({
                 # raw_score is the score before the cross-article category-diversity decay.
@@ -1770,6 +1807,9 @@ def collect_and_rank(
                 "term_total_hits": hit["term_total_hits"],
                 "term_decayed_hits": round(hit["term_decayed_hits"], 2),
                 "unique_term_hits": hit["unique_term_hits"],
+                "japan_anchor_hit": anchor["japan_anchor_hit"],
+                "japan_anchor_bonus": anchor["japan_anchor_bonus"],
+                "anchor_only": anchor_only,
                 "matched_terms": ", ".join(hit["matched_terms_with_counts"][:18]),
                 "term_categories": ", ".join(f"{k}:{v}" for k, v in sorted(hit["category_counts"].items())),
                 "title": title,
@@ -1900,7 +1940,7 @@ def render_result_cards(df: pd.DataFrame) -> None:
             st.markdown(f"[タイトルをGoogle翻訳で開く]({translate_url})")
         st.caption(
             f"score={row['score']} | raw={row.get('raw_score', '')} | cat decay={row.get('category_decay_multiplier', '')} | raw hits={row['term_total_hits']} | decayed={row.get('term_decayed_hits', '')} | "
-            f"unique={row['unique_term_hits']} | {row['source']} / {row['category']} | "
+            f"unique={row['unique_term_hits']} | Japan/Japanese bonus={row.get('japan_anchor_bonus', 0)} | {row['source']} / {row['category']} | "
             f"feed position={row['feed_position']} | {row['published'] or 'date unknown'}"
         )
         st.write("**Matched terms:** " + str(row["matched_terms"]))
@@ -1911,7 +1951,7 @@ def main() -> None:
     st.set_page_config(page_title="海外日本バズRSSランキング", layout="wide")
     st.title("海外日本バズRSSランキング")
     st.caption(
-        "海外RSSの英語タイトル記事だけを巡回し、全カテゴリ横断の日本特有語上位1000語がタイトル・URL・RSSメタデータに多く出る記事をランキング表示します。表示件数は最大100件まで調整できます。"
+        "海外RSSの英語タイトル記事だけを巡回し、日本特有語1000語と、Japan/Japaneseの上限0.5点アンカーボーナスでランキング表示します。表示件数は最大100件まで調整できます。"
     )
 
     with st.sidebar:
@@ -2059,6 +2099,7 @@ def main() -> None:
             "term_total_hits",
             "term_decayed_hits",
             "unique_term_hits",
+            "japan_anchor_bonus",
             "term_categories",
             "matched_terms",
             "title",
