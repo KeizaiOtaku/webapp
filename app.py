@@ -27,9 +27,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "2026-06-17-rss-japan-buzz-top1000-japan-anchor-bonus"
-DEFAULT_RANKING_LIMIT = 30
+APP_VERSION = "2026-06-17-rss-japan-buzz-top1000-japan-anchor-min05-public-minimal"
 MAX_RANKING_LIMIT = 100
+DEFAULT_RANKING_LIMIT = MAX_RANKING_LIMIT
 
 # Japan / Japanese are intentionally NOT included here.
 # The term list is a stricter all-category top-1000 list of Japan-specific terms; broad generic phrases are removed.
@@ -1930,29 +1930,26 @@ def add_translation_columns(
 
 
 def render_result_cards(df: pd.DataFrame) -> None:
+    """Render only a linked ranking: rank number + title link."""
+    items: list[str] = []
     for _, row in df.iterrows():
-        st.markdown(f"### {int(row['rank'])}. [{row['title']}]({row['url']})")
-        title_ja = str(row.get("title_ja", "") or "").strip()
-        if title_ja:
-            st.write(f"**和訳:** {title_ja}")
-        translate_url = str(row.get("translate_url", "") or "").strip()
-        if translate_url:
-            st.markdown(f"[タイトルをGoogle翻訳で開く]({translate_url})")
-        st.caption(
-            f"score={row['score']} | raw={row.get('raw_score', '')} | cat decay={row.get('category_decay_multiplier', '')} | raw hits={row['term_total_hits']} | decayed={row.get('term_decayed_hits', '')} | "
-            f"unique={row['unique_term_hits']} | Japan/Japanese bonus={row.get('japan_anchor_bonus', 0)} | {row['source']} / {row['category']} | "
-            f"feed position={row['feed_position']} | {row['published'] or 'date unknown'}"
-        )
-        st.write("**Matched terms:** " + str(row["matched_terms"]))
-        st.divider()
+        title = html.escape(str(row.get("title", "") or ""))
+        url = html.escape(str(row.get("url", "") or ""), quote=True)
+        rank = int(row.get("rank", len(items) + 1))
+        if url:
+            items.append(
+                f'<li><a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a></li>'
+            )
+        else:
+            items.append(f"<li>{title}</li>")
+
+    if items:
+        st.markdown("<ol>" + "".join(items) + "</ol>", unsafe_allow_html=True)
 
 
 def main() -> None:
-    st.set_page_config(page_title="海外日本バズRSSランキング", layout="wide")
-    st.title("海外日本バズRSSランキング")
-    st.caption(
-        "海外RSSの英語タイトル記事だけを巡回し、日本特有語1000語と、Japan/Japaneseの上限0.5点アンカーボーナスでランキング表示します。表示件数は最大100件まで調整できます。"
-    )
+    st.set_page_config(page_title="海外で注目されている日本のニュースランキング", layout="wide")
+    st.title("海外で注目されている日本のニュースランキング")
 
     with st.sidebar:
         st.header("設定")
@@ -1982,36 +1979,6 @@ def main() -> None:
             step=1,
         )
 
-        st.markdown("---")
-        st.subheader("タイトル和訳")
-        translation_mode = st.selectbox(
-            "和訳モード",
-            ["OFF", "翻訳リンクのみ", "LibreTranslate互換APIで和訳"],
-            index=0,
-        )
-        try:
-            default_translate_endpoint = st.secrets.get("LIBRETRANSLATE_ENDPOINT", "")
-            default_translate_key = st.secrets.get("LIBRETRANSLATE_API_KEY", "")
-        except Exception:
-            default_translate_endpoint = ""
-            default_translate_key = ""
-        libre_endpoint = ""
-        libre_api_key = ""
-        translation_timeout_sec = 10
-        if translation_mode == "LibreTranslate互換APIで和訳":
-            libre_endpoint = st.text_input(
-                "LibreTranslate互換エンドポイント",
-                value=default_translate_endpoint,
-                placeholder="https://your-libretranslate.example.com",
-            )
-            libre_api_key = st.text_input(
-                "APIキー（必要な場合のみ）",
-                value=default_translate_key,
-                type="password",
-            )
-            translation_timeout_sec = st.slider("和訳APIタイムアウト 秒", 3, 30, 10, 1)
-            st.caption("未設定の場合はAPI和訳を行わず、翻訳リンクだけ表示します。")
-
         sources = sorted({f["source"] for f in RSS_FEEDS})
         categories = sorted({f["category"] for f in RSS_FEEDS})
         selected_sources = st.multiselect("巡回する媒体", sources, default=sources)
@@ -2023,24 +1990,7 @@ def main() -> None:
         )
         run = st.button("RSSを巡回してランキング作成", type="primary")
 
-    st.info(
-        "表示するのはタイトル・媒体・日時・URL・命中語・独自スコアのみです。記事本文や画像は取得・転載しません。"
-    )
-    st.caption(
-        "同じ記事内で同一語が複数回出る場合は、1回目=1.0、2回目=0.5、3回目=0.25... と半減加点します。"
-    )
-    st.caption(
-        "さらに全体ランキング前に、同一RSSカテゴリ内の上位raw score記事1本につきスコアを半減します。例: 同カテゴリ1位=1.0倍、2位=0.5倍、3位=0.25倍。"
-    )
-
     if not run:
-        st.subheader("仕様")
-        st.write(
-            f"登録RSS: {len(RSS_FEEDS)}本 / 日本特有語: {len(JAPAN_SPECIFIC_TERMS_1000)}語 / ランキング表示上限: {MAX_RANKING_LIMIT}件"
-        )
-        st.write("サイドバーで期間・媒体・カテゴリを指定して実行してください。")
-        with st.expander("日本特有語1000語を見る"):
-            st.write(", ".join(JAPAN_SPECIFIC_TERMS_1000))
         return
 
     if max_entries_per_feed <= 0:
@@ -2064,62 +2014,10 @@ def main() -> None:
             ranking_limit=ranking_limit,
         )
 
-    st.subheader("ランキング")
     if df.empty:
-        st.warning("条件に合う記事が見つかりませんでした。期間を長くする、取得件数を増やす、媒体カテゴリを増やすなどを試してください。")
+        st.warning("条件に合う記事が見つかりませんでした。")
     else:
-        if translation_mode != "OFF":
-            with st.spinner("タイトル和訳列を作成しています..."):
-                df = add_translation_columns(
-                    df=df,
-                    mode=translation_mode,
-                    endpoint=libre_endpoint,
-                    api_key=libre_api_key,
-                    timeout_sec=translation_timeout_sec,
-                )
-
-        c1, c2, c3 = st.columns(3)
-        c1.metric("表示件数", f"{len(df)} / {ranking_limit}")
-        c2.metric("最高補正後スコア", float(df["score"].max()))
-        c3.metric("対象期間", f"直近{lookback_hours}時間")
-
-        st.download_button(
-            "ランキングCSVをダウンロード",
-            data=df_to_csv_bytes(df),
-            file_name="rss_japan_buzz_ranking.csv",
-            mime="text/csv",
-        )
-
-        display_cols = [
-            "rank",
-            "score",
-            "raw_score",
-            "category_decay_rank",
-            "category_decay_multiplier",
-            "term_total_hits",
-            "term_decayed_hits",
-            "unique_term_hits",
-            "japan_anchor_bonus",
-            "term_categories",
-            "matched_terms",
-            "title",
-            "title_ja",
-            "translate_url",
-            "source",
-            "category",
-            "published",
-            "url",
-        ]
-        display_cols = [c for c in display_cols if c in df.columns]
-        st.dataframe(df[display_cols], use_container_width=True, hide_index=True)
-
-        st.markdown("---")
-        st.subheader("リンク付き表示")
         render_result_cards(df)
-
-    if not err_df.empty:
-        with st.expander(f"取得エラー・失敗RSS（{len(err_df)}件）"):
-            st.dataframe(err_df, use_container_width=True, hide_index=True)
 
 
 if __name__ == "__main__":
