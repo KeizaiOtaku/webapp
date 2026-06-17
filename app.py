@@ -16,7 +16,7 @@ import streamlit as st
 # 基本設定
 # ============================================================
 
-APP_VERSION = "2026-06-17-fixed10-zero-interval"
+APP_VERSION = "2026-06-17-fixed10-gdelt-querysyntax-safe"
 GDELT_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
 CACHE_TTL_SECONDS = 60 * 30
 USER_AGENT = "overseas-japan-news-streamlit/1.1"
@@ -59,6 +59,14 @@ STANDALONE_TERMS = {
     "japanese economy",
     "anime",
     "manga",
+}
+
+# GDELTは「括弧はOR文だけに使える」という制約があるため、
+# tourism / video games のように単独では広すぎる語は、括弧やANDを使わず
+# `Japan tourism` のような暗黙ANDの単独クエリとして投げる。
+ANCHOR_WITH_JAPAN_TERMS = {
+    "tourism",
+    "video games",
 }
 
 MAJOR_MEDIA_DOMAINS = {
@@ -121,32 +129,71 @@ def chunk_list(items: List[str], chunk_size: int) -> List[List[str]]:
     return [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
 
 
-def build_fixed_chunk_query_en(terms: List[str], domestic: bool) -> str:
-    """固定語を小さな塊に分けてGDELTへ投げる。巨大クエリによる非JSON応答を避ける。"""
-    anchors = "(Japan OR Japanese OR Tokyo OR Kyoto OR Osaka)"
-    parts = []
+def gdelt_or_group(terms: List[str]) -> str:
+    """GDELT向けORグループ。括弧はOR文だけに使う。"""
+    clean_terms = [quote_term(t) for t in terms if str(t).strip()]
+    if not clean_terms:
+        return ""
+    if len(clean_terms) == 1:
+        # 単一語を括弧で囲むと、GDELTが
+        # "Parentheses may only be used around OR'd statements" を返すことがある。
+        return clean_terms[0]
+    return "(" + " OR ".join(clean_terms) + ")"
 
-    for term in terms:
-        term_clean = str(term).strip()
-        if not term_clean:
-            continue
-        q = quote_term(term_clean)
-        low = term_clean.lower()
 
-        if low in STANDALONE_TERMS or "japan" in low or "japanese" in low:
-            parts.append(q)
-        else:
-            # food / politics / film など単独では広すぎる語は、日本アンカーとANDする
-            parts.append(f"({anchors} AND {q})")
+def build_fixed_queries_en(domestic: bool, fixed_chunk_size: int) -> List[Tuple[str, str]]:
+    """
+    固定10語をGDELT構文エラーが出ない形の複数クエリにする。
 
-    body = " OR ".join(parts)
+    重要:
+    - GDELTは `(<A> AND <B>)` や入れ子括弧に弱い。
+    - 括弧は `(A OR B OR C)` のようなOR文だけに使う。
+    - 単独では広すぎる語は `Japan tourism` のように括弧なしの暗黙ANDで投げる。
+    """
     source_filter = "sourcecountry:japan" if domestic else "-sourcecountry:japan"
-    return f"({body}) {source_filter}"
+    queries: List[Tuple[str, str]] = []
+
+    or_terms: List[str] = []
+    anchored_terms: List[str] = []
+
+    for term in FIXED_KEYWORDS_50:
+        low = str(term).strip().lower()
+        if low in ANCHOR_WITH_JAPAN_TERMS:
+            anchored_terms.append(term)
+        else:
+            or_terms.append(term)
+
+    # 日本関連性が強い語はORでまとめる。括弧の中はORだけなのでGDELT構文に合う。
+    chunk_size = max(1, int(fixed_chunk_size))
+    for i, chunk in enumerate(chunk_list(or_terms, chunk_size), start=1):
+        body = gdelt_or_group(chunk)
+        if body:
+            label = f"fixed_{'domestic' if domestic else 'overseas'}_or_chunk_{i}"
+            queries.append((label, f"{body} {source_filter}"))
+
+    # 広すぎる語は、括弧やAND演算子を使わず、Japanとの暗黙ANDで単独検索する。
+    for term in anchored_terms:
+        q = f"Japan {quote_term(term)} {source_filter}"
+        safe_label = re.sub(r"[^A-Za-z0-9]+", "_", term).strip("_").lower()
+        label = f"fixed_{'domestic' if domestic else 'overseas'}_anchored_{safe_label}"
+        queries.append((label, q))
+
+    return queries
+
+
+def build_fixed_chunk_query_en(terms: List[str], domestic: bool) -> str:
+    """
+    旧関数互換用。collect_newsではbuild_fixed_queries_enを使う。
+    ここでもAND/入れ子括弧は使わない。
+    """
+    source_filter = "sourcecountry:japan" if domestic else "-sourcecountry:japan"
+    body = gdelt_or_group(terms)
+    return f"{body} {source_filter}" if body else source_filter
 
 
 def build_fixed_chunk_query_ja(terms: List[str]) -> str:
-    body = " OR ".join(quote_term(t) for t in terms if str(t).strip())
-    return f"({body}) sourcecountry:japan"
+    body = gdelt_or_group([t for t in terms if str(t).strip()])
+    return f"{body} sourcecountry:japan" if body else "sourcecountry:japan"
 
 
 def sanitize_buzzword_for_query(word: str) -> str:
@@ -163,8 +210,11 @@ def build_buzz_query(word: str, domestic: bool) -> str:
         return ""
     w = quote_term(word)
     if domestic:
-        return f"({w}) sourcecountry:japan"
-    return f"({w}) AND (Japan OR Japanese OR Tokyo OR Kyoto OR Osaka) -sourcecountry:japan"
+        # 単一語/単一フレーズを括弧で囲まない。
+        return f"{w} sourcecountry:japan"
+    # GDELTでは `({w}) AND (Japan OR ...)` が構文エラーになりやすい。
+    # そのため、括弧なしの暗黙ANDにする。
+    return f"{w} Japan -sourcecountry:japan"
 
 
 # ============================================================
@@ -599,28 +649,24 @@ def collect_news(timespan: str, maxrecords_fixed: int, maxrecords_buzz: int, max
     all_rows = []
     query_log = []
 
-    # 英語固定10語を小分けにして、海外・国内の両方を検索
-    for i, chunk in enumerate(chunk_list(FIXED_KEYWORDS_50, fixed_chunk_size), start=1):
-        q_over = build_fixed_chunk_query_en(chunk, domestic=False)
-        label_over = f"fixed_overseas_chunk_{i}"
+    # 英語固定10語を、GDELT構文に合う安全なクエリ群へ変換して検索。
+    # 括弧はORグループだけに使い、AND/入れ子括弧は使わない。
+    for label_over, q_over in build_fixed_queries_en(domestic=False, fixed_chunk_size=fixed_chunk_size):
         query_log.append({"label": label_over, "query": q_over})
         articles, err = fetch_gdelt_cached(q_over, timespan, maxrecords_fixed)
         if err:
             errors.append(f"{label_over}: {err}")
         for a in articles:
             all_rows.append(normalize_article(a, origin_hint="overseas", query_label=label_over))
-
         polite_sleep(sleep_sec)
 
-        q_dom = build_fixed_chunk_query_en(chunk, domestic=True)
-        label_dom = f"fixed_domestic_chunk_{i}"
+    for label_dom, q_dom in build_fixed_queries_en(domestic=True, fixed_chunk_size=fixed_chunk_size):
         query_log.append({"label": label_dom, "query": q_dom})
         articles, err = fetch_gdelt_cached(q_dom, timespan, maxrecords_fixed)
         if err:
             errors.append(f"{label_dom}: {err}")
         for a in articles:
             all_rows.append(normalize_article(a, origin_hint="domestic", query_label=label_dom))
-
         polite_sleep(sleep_sec)
 
     # 日本語固定10語はGDELT側で不安定なことがあるため、任意ONにする
@@ -757,7 +803,7 @@ if result is None:
     st.markdown("### このアプリの仕組み")
     st.markdown(
         """
-- 固定50ワードを1つずつではなく、数個の小クエリに分割してGDELTへ投げます。
+- 固定10ワードをGDELT構文に合う小クエリへ変換して投げます。
 - GDELTがJSON以外を返した場合は、レスポンス冒頭をエラーに表示します。
 - 海外記事タイトルからバズワードを自動抽出し、上位だけ追加検索します。
 - 海外記事数・海外媒体数・海外国数・大手媒体数を加点します。
