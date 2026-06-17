@@ -28,7 +28,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "2026-06-17-rss-japan-buzz-public-minimal-admin-settings"
+APP_VERSION = "2026-06-17-rss-japan-buzz-public-minimal-caption-translate-notice"
 MAX_RANKING_LIMIT = 1000
 DEFAULT_RANKING_LIMIT = MAX_RANKING_LIMIT
 FIXED_LOOKBACK_HOURS = 168
@@ -2077,18 +2077,19 @@ def render_admin_breakdown(df: pd.DataFrame, err_df: pd.DataFrame, stats: dict[s
 
 
 def render_result_cards(df: pd.DataFrame) -> None:
-    """Render only a linked ranking: rank number + title link."""
+    """Render only a linked ranking: rank number + title plus source link."""
     items: list[str] = []
     for _, row in df.iterrows():
         title = html.escape(str(row.get("title", "") or ""))
+        source = html.escape(str(row.get("source", "") or ""))
+        display_text = f"{title} ({source})" if source else title
         url = html.escape(str(row.get("url", "") or ""), quote=True)
-        rank = int(row.get("rank", len(items) + 1))
         if url:
             items.append(
-                f'<li><a href="{url}" target="_blank" rel="noopener noreferrer">{title}</a></li>'
+                f'<li><a href="{url}" target="_blank" rel="noopener noreferrer">{display_text}</a></li>'
             )
         else:
-            items.append(f"<li>{title}</li>")
+            items.append(f"<li>{display_text}</li>")
 
     if items:
         st.markdown("<ol>" + "".join(items) + "</ol>", unsafe_allow_html=True)
@@ -2097,6 +2098,8 @@ def render_result_cards(df: pd.DataFrame) -> None:
 def main() -> None:
     st.set_page_config(page_title="海外で注目されている日本のニュースランキング", layout="wide")
     st.title("海外で注目されている日本のニュースランキング")
+    st.caption("海外ニュースサイトを周回して日本のニュースと思われる記事を独自アルゴリズムでランキング化しています。日本以外のニュースもわずかに含まれます。")
+    st.caption("翻訳機能は無いのでブラウザの日本語翻訳などをお使いください。")
 
     # Public users can only run the ranking with fixed/default settings.
     # All configuration controls are shown only after admin authentication.
