@@ -4,6 +4,7 @@
 # - Excludes RSS sources previously identified as clearly restricted for commercial/non-commercial use
 # - Ranks English RSS items by Japan-specific 1000-term hits in title / URL / metadata
 # - Repeated hits of the same term use geometric decay: 1.0, 0.5, 0.25, ...
+# - Before global ranking, items in the same RSS category are also decayed: 1st=1.0, 2nd=0.5, 3rd=0.25, ...
 
 from __future__ import annotations
 
@@ -25,8 +26,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "2026-06-17-rss-japan-buzz-1000-repeat-decay-no-feedparser"
-MAX_RANKING = 30
+APP_VERSION = "2026-06-17-rss-japan-buzz-1000-repeat-category-decay-limit100"
+DEFAULT_RANKING_LIMIT = 30
+MAX_RANKING_LIMIT = 100
 
 # Japan / Japanese are intentionally NOT included here.
 # The term list is weighted and category-balanced:
@@ -1502,6 +1504,7 @@ def collect_and_rank(
     include_undated: bool,
     include_summary_for_scoring: bool,
     min_unique_terms: int,
+    ranking_limit: int,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=lookback_hours)
@@ -1570,7 +1573,11 @@ def collect_and_rank(
             )
 
             rows.append({
+                # raw_score is the score before the cross-article category-diversity decay.
+                "raw_score": round(score, 2),
                 "score": round(score, 2),
+                "category_decay_rank": 1,
+                "category_decay_multiplier": 1.0,
                 "term_total_hits": hit["term_total_hits"],
                 "term_decayed_hits": round(hit["term_decayed_hits"], 2),
                 "unique_term_hits": hit["unique_term_hits"],
@@ -1593,10 +1600,21 @@ def collect_and_rank(
 
     df = pd.DataFrame(rows)
     if not df.empty:
+        # 1) Sort by raw score within each RSS category.
+        # 2) Apply category-diversity decay: for each already-higher raw-score article
+        #    in the same category, halve the score.
+        #    Example: category top=1.0x, second=0.5x, third=0.25x.
+        raw_sort_cols = ["raw_score", "term_decayed_hits", "term_total_hits", "unique_term_hits", "published"]
+        df = df.sort_values(by=raw_sort_cols, ascending=[False, False, False, False, False]).reset_index(drop=True)
+        df["category_decay_rank"] = df.groupby("category", sort=False).cumcount() + 1
+        df["category_decay_multiplier"] = 0.5 ** (df["category_decay_rank"] - 1)
+        df["score"] = (df["raw_score"] * df["category_decay_multiplier"]).round(2)
+
+        # 3) Global ranking after category decay.
         df = df.sort_values(
-            by=["score", "term_decayed_hits", "term_total_hits", "unique_term_hits", "published"],
-            ascending=[False, False, False, False, False],
-        ).head(MAX_RANKING).reset_index(drop=True)
+            by=["score", "raw_score", "term_decayed_hits", "term_total_hits", "unique_term_hits", "published"],
+            ascending=[False, False, False, False, False, False],
+        ).head(ranking_limit).reset_index(drop=True)
         df.insert(0, "rank", range(1, len(df) + 1))
 
     err_df = pd.DataFrame(errors)
@@ -1611,7 +1629,7 @@ def render_result_cards(df: pd.DataFrame) -> None:
     for _, row in df.iterrows():
         st.markdown(f"### {int(row['rank'])}. [{row['title']}]({row['url']})")
         st.caption(
-            f"score={row['score']} | raw hits={row['term_total_hits']} | decayed={row.get('term_decayed_hits', '')} | "
+            f"score={row['score']} | raw={row.get('raw_score', '')} | cat decay={row.get('category_decay_multiplier', '')} | raw hits={row['term_total_hits']} | decayed={row.get('term_decayed_hits', '')} | "
             f"unique={row['unique_term_hits']} | {row['source']} / {row['category']} | "
             f"feed position={row['feed_position']} | {row['published'] or 'date unknown'}"
         )
@@ -1623,7 +1641,7 @@ def main() -> None:
     st.set_page_config(page_title="海外日本バズRSSランキング", layout="wide")
     st.title("海外日本バズRSSランキング")
     st.caption(
-        "海外RSSの英語タイトル記事だけを巡回し、日本特有1000語がタイトル・URL・RSSメタデータに多く出る記事を上位30件で表示します。"
+        "海外RSSの英語タイトル記事だけを巡回し、日本特有1000語がタイトル・URL・RSSメタデータに多く出る記事をランキング表示します。表示件数は最大100件まで調整できます。"
     )
 
     with st.sidebar:
@@ -1646,6 +1664,13 @@ def main() -> None:
             value=True,
         )
         min_unique_terms = st.slider("最低ユニーク命中語数", 1, 5, 1, 1)
+        ranking_limit = st.slider(
+            "ランキング表示件数",
+            min_value=1,
+            max_value=MAX_RANKING_LIMIT,
+            value=DEFAULT_RANKING_LIMIT,
+            step=1,
+        )
 
         sources = sorted({f["source"] for f in RSS_FEEDS})
         categories = sorted({f["category"] for f in RSS_FEEDS})
@@ -1664,11 +1689,14 @@ def main() -> None:
     st.caption(
         "同じ記事内で同一語が複数回出る場合は、1回目=1.0、2回目=0.5、3回目=0.25... と半減加点します。"
     )
+    st.caption(
+        "さらに全体ランキング前に、同一RSSカテゴリ内の上位raw score記事1本につきスコアを半減します。例: 同カテゴリ1位=1.0倍、2位=0.5倍、3位=0.25倍。"
+    )
 
     if not run:
         st.subheader("仕様")
         st.write(
-            f"登録RSS: {len(RSS_FEEDS)}本 / 日本特有語: {len(JAPAN_SPECIFIC_TERMS_1000)}語 / ランキング上限: {MAX_RANKING}件"
+            f"登録RSS: {len(RSS_FEEDS)}本 / 日本特有語: {len(JAPAN_SPECIFIC_TERMS_1000)}語 / ランキング表示上限: {MAX_RANKING_LIMIT}件"
         )
         st.write("サイドバーで期間・媒体・カテゴリを指定して実行してください。")
         with st.expander("日本特有語1000語を見る"):
@@ -1693,6 +1721,7 @@ def main() -> None:
             include_undated=include_undated,
             include_summary_for_scoring=include_summary_for_scoring,
             min_unique_terms=min_unique_terms,
+            ranking_limit=ranking_limit,
         )
 
     st.subheader("ランキング")
@@ -1700,8 +1729,8 @@ def main() -> None:
         st.warning("条件に合う記事が見つかりませんでした。期間を長くする、取得件数を増やす、媒体カテゴリを増やすなどを試してください。")
     else:
         c1, c2, c3 = st.columns(3)
-        c1.metric("表示件数", len(df))
-        c2.metric("最高スコア", float(df["score"].max()))
+        c1.metric("表示件数", f"{len(df)} / {ranking_limit}")
+        c2.metric("最高補正後スコア", float(df["score"].max()))
         c3.metric("対象期間", f"直近{lookback_hours}時間")
 
         st.download_button(
@@ -1714,6 +1743,9 @@ def main() -> None:
         display_cols = [
             "rank",
             "score",
+            "raw_score",
+            "category_decay_rank",
+            "category_decay_multiplier",
             "term_total_hits",
             "term_decayed_hits",
             "unique_term_hits",
