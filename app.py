@@ -27,8 +27,8 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "2026-06-17-rss-japan-buzz-top1000-japan-anchor-min05-public-minimal"
-MAX_RANKING_LIMIT = 100
+APP_VERSION = "2026-06-17-rss-japan-buzz-top1000-japan-anchor-min05-public-minimal-limit1000-count"
+MAX_RANKING_LIMIT = 1000
 DEFAULT_RANKING_LIMIT = MAX_RANKING_LIMIT
 
 # Japan / Japanese are intentionally NOT included here.
@@ -1719,7 +1719,7 @@ def collect_and_rank(
     include_summary_for_scoring: bool,
     min_unique_terms: int,
     ranking_limit: int,
-) -> tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=lookback_hours)
     rows: list[dict[str, Any]] = []
@@ -1727,6 +1727,17 @@ def collect_and_rank(
     seen_keys: set[str] = set()
 
     feeds = [f for f in RSS_FEEDS if f["source"] in selected_sources and f["category"] in selected_categories]
+    stats: dict[str, int] = {
+        "selected_feeds": len(feeds),
+        "feeds_ok": 0,
+        "feeds_error": 0,
+        # Number of RSS entries pulled from selected feeds before title/date/match filtering.
+        "rss_entries_seen": 0,
+        # Number of entries after English/date/dedupe filters, before Japan relevance scoring.
+        "articles_checked": 0,
+        # Number of articles that passed Japan-term or Japan/Japanese-anchor relevance checks before ranking cut.
+        "ranking_candidates": 0,
+    }
 
     progress = st.progress(0, text="RSSを巡回中...") if feeds else None
     total_feeds = max(1, len(feeds))
@@ -1737,6 +1748,7 @@ def collect_and_rank(
 
         parsed, err = fetch_feed(cfg["url"], timeout_sec=timeout_sec)
         if err:
+            stats["feeds_error"] += 1
             errors.append({"source": cfg["source"], "category": cfg["category"], "url": cfg["url"], "error": err})
             if progress:
                 progress.progress((feed_i + 1) / total_feeds, text=f"RSS巡回中... {feed_i + 1}/{len(feeds)}")
@@ -1748,7 +1760,9 @@ def collect_and_rank(
         except Exception:
             feed_title = ""
 
+        stats["feeds_ok"] += 1
         entries = list(parsed.entries or [])[:max_entries_per_feed]
+        stats["rss_entries_seen"] += len(entries)
         for pos, entry in enumerate(entries):
             item = build_item_from_entry(cfg, feed_title, entry, pos)
             title = item["title"]
@@ -1766,6 +1780,7 @@ def collect_and_rank(
             if not dedupe_key or dedupe_key in seen_keys:
                 continue
             seen_keys.add(dedupe_key)
+            stats["articles_checked"] += 1
 
             hit = count_japan_terms(item, include_summary_for_scoring)
             anchor = count_japan_anchor_bonus(item)
@@ -1797,6 +1812,8 @@ def collect_and_rank(
                 # Source/category/position/recency bonuses are not added here, so anchor-only articles do not dominate.
                 score = anchor["japan_anchor_bonus"]  # capped at 0.5 by count_japan_anchor_bonus()
                 anchor_only = 1
+
+            stats["ranking_candidates"] += 1
 
             rows.append({
                 # raw_score is the score before the cross-article category-diversity decay.
@@ -1847,7 +1864,7 @@ def collect_and_rank(
         df.insert(0, "rank", range(1, len(df) + 1))
 
     err_df = pd.DataFrame(errors)
-    return df, err_df
+    return df, err_df, stats
 
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -1971,13 +1988,11 @@ def main() -> None:
             value=True,
         )
         min_unique_terms = st.slider("最低ユニーク命中語数", 1, 5, 1, 1)
-        ranking_limit = st.slider(
-            "ランキング表示件数",
-            min_value=1,
-            max_value=MAX_RANKING_LIMIT,
-            value=DEFAULT_RANKING_LIMIT,
-            step=1,
-        )
+        # Public display is always aligned with the configured upper limit.
+        # Do not expose a separate display-count slider because Streamlit may
+        # preserve an old session-state value such as 30 after deployment.
+        ranking_limit = MAX_RANKING_LIMIT
+        st.caption(f"ランキング上限: {MAX_RANKING_LIMIT} 件")
 
         sources = sorted({f["source"] for f in RSS_FEEDS})
         categories = sorted({f["category"] for f in RSS_FEEDS})
@@ -2001,7 +2016,7 @@ def main() -> None:
         return
 
     with st.spinner("RSSを巡回してランキングを作成しています..."):
-        df, err_df = collect_and_rank(
+        df, err_df, stats = collect_and_rank(
             selected_sources=selected_sources,
             selected_categories=selected_categories,
             lookback_hours=lookback_hours,
@@ -2013,6 +2028,13 @@ def main() -> None:
             min_unique_terms=min_unique_terms,
             ranking_limit=ranking_limit,
         )
+
+    st.caption(
+        f"検索対象記事数: {int(stats.get('rss_entries_seen', 0)):,}件 / "
+        f"判定記事数: {int(stats.get('articles_checked', 0)):,}件 / "
+        f"ランキング候補: {int(stats.get('ranking_candidates', 0)):,}件 / "
+        f"表示: {len(df):,}件"
+    )
 
     if df.empty:
         st.warning("条件に合う記事が見つかりませんでした。")
