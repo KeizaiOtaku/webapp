@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import csv
+import hmac
 import math
 import re
 import time
@@ -27,7 +28,7 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "2026-06-17-rss-japan-buzz-top1000-japan-anchor-min05-public-minimal-limit1000-count"
+APP_VERSION = "2026-06-17-rss-japan-buzz-top1000-public-minimal-limit1000-count-admin-breakdown"
 MAX_RANKING_LIMIT = 1000
 DEFAULT_RANKING_LIMIT = MAX_RANKING_LIMIT
 
@@ -1797,20 +1798,34 @@ def collect_and_rank(
 
             if has_japan_terms:
                 # Main objective: Japan-specific term density, plus capped Japan/Japanese anchor bonus and RSS editorial prominence.
+                term_score_component = 3.0 * hit["term_weighted_hits"]
+                unique_term_component = 5.0 * hit["unique_term_hits"]
+                anchor_bonus_component = anchor["japan_anchor_bonus"]
+                source_component = 1.0 * source_weight
+                category_component = 0.8 * cat_bonus
+                feed_position_component = 0.7 * p_bonus
+                recency_component = 0.8 * r_bonus
                 score = (
-                    3.0 * hit["term_weighted_hits"]
-                    + 5.0 * hit["unique_term_hits"]
-                    + anchor["japan_anchor_bonus"]
-                    + 1.0 * source_weight
-                    + 0.8 * cat_bonus
-                    + 0.7 * p_bonus
-                    + 0.8 * r_bonus
+                    term_score_component
+                    + unique_term_component
+                    + anchor_bonus_component
+                    + source_component
+                    + category_component
+                    + feed_position_component
+                    + recency_component
                 )
                 anchor_only = 0
             else:
                 # If Japan/Japanese is the only Japan-related signal, keep it visible but intentionally weak.
                 # Source/category/position/recency bonuses are not added here, so anchor-only articles do not dominate.
-                score = anchor["japan_anchor_bonus"]  # capped at 0.5 by count_japan_anchor_bonus()
+                term_score_component = 0.0
+                unique_term_component = 0.0
+                anchor_bonus_component = anchor["japan_anchor_bonus"]
+                source_component = 0.0
+                category_component = 0.0
+                feed_position_component = 0.0
+                recency_component = 0.0
+                score = anchor_bonus_component  # capped at 0.5 by count_japan_anchor_bonus()
                 anchor_only = 1
 
             stats["ranking_candidates"] += 1
@@ -1821,6 +1836,13 @@ def collect_and_rank(
                 "score": round(score, 2),
                 "category_decay_rank": 1,
                 "category_decay_multiplier": 1.0,
+                "term_score_component": round(term_score_component, 2),
+                "unique_term_component": round(unique_term_component, 2),
+                "anchor_bonus_component": round(anchor_bonus_component, 2),
+                "source_component": round(source_component, 2),
+                "category_component": round(category_component, 2),
+                "feed_position_component": round(feed_position_component, 2),
+                "recency_component": round(recency_component, 2),
                 "term_total_hits": hit["term_total_hits"],
                 "term_decayed_hits": round(hit["term_decayed_hits"], 2),
                 "unique_term_hits": hit["unique_term_hits"],
@@ -1835,6 +1857,9 @@ def collect_and_rank(
                 "published": item["published"],
                 "feed_position": item["feed_position"] + 1,
                 "source_weight": source_weight,
+                "category_bonus_raw": cat_bonus,
+                "feed_position_bonus_raw": round(p_bonus, 2),
+                "recency_bonus_raw": round(r_bonus, 2),
                 "url": item["link"],
             })
 
@@ -1946,6 +1971,108 @@ def add_translation_columns(
     return out
 
 
+def get_configured_admin_password() -> str:
+    """Read the admin password from Streamlit Secrets.
+
+    Supported formats:
+      ADMIN_PASSWORD = "..."
+      admin_password = "..."
+      [admin]
+password = "..."
+    """
+    candidates: list[str] = []
+    try:
+        candidates.append(str(st.secrets.get("ADMIN_PASSWORD", "")))
+    except Exception:
+        pass
+    try:
+        candidates.append(str(st.secrets.get("admin_password", "")))
+    except Exception:
+        pass
+    try:
+        admin_cfg = st.secrets.get("admin", {})
+        if isinstance(admin_cfg, dict):
+            candidates.append(str(admin_cfg.get("password", "")))
+        else:
+            candidates.append(str(getattr(admin_cfg, "password", "")))
+    except Exception:
+        pass
+    for candidate in candidates:
+        candidate = candidate.strip()
+        if candidate:
+            return candidate
+    return ""
+
+
+def render_admin_breakdown(df: pd.DataFrame, err_df: pd.DataFrame, stats: dict[str, int]) -> None:
+    """Render scoring details only in the password-protected admin view."""
+    st.markdown("---")
+    st.subheader("管理者画面：スコア内訳")
+    st.caption(
+        "通常記事: raw_score = 特有語点 + ユニーク語点 + Japan/Japanese補助 + 媒体点 + カテゴリ点 + RSS掲載順位点 + 新着点。"
+        "最終score = raw_score × カテゴリ分散係数。Japan/Japaneseだけの記事は0.5点固定です。"
+    )
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("検索対象記事数", f"{int(stats.get('rss_entries_seen', 0)):,}")
+    c2.metric("判定記事数", f"{int(stats.get('articles_checked', 0)):,}")
+    c3.metric("ランキング候補", f"{int(stats.get('ranking_candidates', 0)):,}")
+    c4.metric("表示件数", f"{len(df):,}")
+
+    if df.empty:
+        st.info("ランキング候補がありません。")
+    else:
+        admin_cols = [
+            "rank",
+            "score",
+            "raw_score",
+            "category_decay_rank",
+            "category_decay_multiplier",
+            "term_score_component",
+            "unique_term_component",
+            "anchor_bonus_component",
+            "source_component",
+            "category_component",
+            "feed_position_component",
+            "recency_component",
+            "anchor_only",
+            "term_total_hits",
+            "term_decayed_hits",
+            "unique_term_hits",
+            "japan_anchor_hit",
+            "matched_terms",
+            "title",
+            "source",
+            "category",
+            "published",
+            "feed_position",
+            "url",
+        ]
+        existing_cols = [c for c in admin_cols if c in df.columns]
+        admin_df = df[existing_cols].copy()
+        st.dataframe(
+            admin_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "url": st.column_config.LinkColumn("url"),
+                "score": st.column_config.NumberColumn("score", format="%.2f"),
+                "raw_score": st.column_config.NumberColumn("raw_score", format="%.2f"),
+                "category_decay_multiplier": st.column_config.NumberColumn("category_decay_multiplier", format="%.4f"),
+            },
+        )
+        st.download_button(
+            "管理者用CSVをダウンロード",
+            data=df_to_csv_bytes(df),
+            file_name="japan_news_ranking_admin_breakdown.csv",
+            mime="text/csv",
+        )
+
+    if not err_df.empty:
+        with st.expander("RSS取得エラー", expanded=False):
+            st.dataframe(err_df, use_container_width=True, hide_index=True)
+
+
 def render_result_cards(df: pd.DataFrame) -> None:
     """Render only a linked ranking: rank number + title link."""
     items: list[str] = []
@@ -2003,6 +2130,21 @@ def main() -> None:
         st.caption(
             "除外済み: Guardian / Washington Post / Le Monde / Google News RSS / Reuters RSS。"
         )
+
+        st.markdown("---")
+        admin_view_requested = st.checkbox("管理者画面を表示", value=False)
+        admin_password_ok = False
+        if admin_view_requested:
+            configured_admin_password = get_configured_admin_password()
+            if configured_admin_password:
+                entered_admin_password = st.text_input("管理者パスワード", type="password")
+                admin_password_ok = hmac.compare_digest(entered_admin_password, configured_admin_password)
+                if entered_admin_password and not admin_password_ok:
+                    st.error("管理者パスワードが違います。")
+            else:
+                st.warning("Secretsに管理者パスワードが未設定です。")
+                st.caption('例: [admin] password = "your-password"')
+
         run = st.button("RSSを巡回してランキング作成", type="primary")
 
     if not run:
@@ -2040,6 +2182,12 @@ def main() -> None:
         st.warning("条件に合う記事が見つかりませんでした。")
     else:
         render_result_cards(df)
+
+    if admin_view_requested:
+        if admin_password_ok:
+            render_admin_breakdown(df, err_df, stats)
+        else:
+            st.info("管理者画面を見るには、サイドバーで管理者パスワードを入力してください。")
 
 
 if __name__ == "__main__":
