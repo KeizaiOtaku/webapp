@@ -16,7 +16,7 @@ import streamlit as st
 # 基本設定
 # ============================================================
 
-APP_VERSION = "2026-06-17-fastmode-japan-japanese-only"
+APP_VERSION = "2026-06-17-fastmode-japan-japanese-only-429-message-fix"
 GDELT_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
 CACHE_TTL_SECONDS = 60 * 30
 USER_AGENT = "overseas-japan-news-streamlit/1.1"
@@ -232,6 +232,12 @@ def gdelt_request(
                     wait_sec = int(retry_after)
                 else:
                     wait_sec = min(90, 4 * (2 ** attempt)) + random.uniform(0, 4)
+
+                last_error = RuntimeError(
+                    f"HTTP 429 Too Many Requests: GDELTのレート制限に当たりました。"
+                    f"retry_after={retry_after}, next_wait_sec={wait_sec:.1f}, "
+                    f"query={query}"
+                )
                 time.sleep(wait_sec)
                 continue
 
