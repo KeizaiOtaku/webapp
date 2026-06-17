@@ -28,12 +28,14 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "2026-06-17-rss-japan-buzz-public-minimal-caption-translate-notice"
+APP_VERSION = "2026-06-17-rss-japan-buzz-auto-4am-jst"
 MAX_RANKING_LIMIT = 1000
 DEFAULT_RANKING_LIMIT = MAX_RANKING_LIMIT
 FIXED_LOOKBACK_HOURS = 168
 FIXED_MAX_ENTRIES_PER_FEED = 100
 FIXED_REQUEST_INTERVAL_SEC = 0.2
+JST = timezone(timedelta(hours=9))
+AUTO_UPDATE_HOUR_JST = 4
 
 # Japan / Japanese are intentionally NOT included here.
 # The term list is a stricter all-category top-1000 list of Japan-specific terms; broad generic phrases are removed.
@@ -1656,8 +1658,8 @@ def parse_feed_xml(content: bytes) -> SimpleNamespace:
     return SimpleNamespace(feed={"title": feed_title}, entries=entries)
 
 
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_feed(url: str, timeout_sec: int) -> tuple[Any | None, str | None]:
+@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
+def fetch_feed(url: str, timeout_sec: int, auto_update_key: str) -> tuple[Any | None, str | None]:
     try:
         resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout_sec)
         if resp.status_code >= 400:
@@ -1723,6 +1725,8 @@ def collect_and_rank(
     include_summary_for_scoring: bool,
     min_unique_terms: int,
     ranking_limit: int,
+    auto_update_key: str = "",
+    show_progress: bool = True,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
     now = datetime.now(timezone.utc)
     cutoff = now - timedelta(hours=lookback_hours)
@@ -1743,14 +1747,14 @@ def collect_and_rank(
         "ranking_candidates": 0,
     }
 
-    progress = st.progress(0, text="RSSを巡回中...") if feeds else None
+    progress = st.progress(0, text="RSSを巡回中...") if (feeds and show_progress) else None
     total_feeds = max(1, len(feeds))
 
     for feed_i, cfg in enumerate(feeds):
         if request_interval_sec > 0 and feed_i > 0:
             time.sleep(request_interval_sec)
 
-        parsed, err = fetch_feed(cfg["url"], timeout_sec=timeout_sec)
+        parsed, err = fetch_feed(cfg["url"], timeout_sec=timeout_sec, auto_update_key=auto_update_key)
         if err:
             stats["feeds_error"] += 1
             errors.append({"source": cfg["source"], "category": cfg["category"], "url": cfg["url"], "error": err})
@@ -1893,6 +1897,61 @@ def collect_and_rank(
 
     err_df = pd.DataFrame(errors)
     return df, err_df, stats
+
+
+def get_jst_auto_update_key(now_utc: datetime | None = None) -> str:
+    """Return a daily cache key that flips at 04:00 JST.
+
+    Example:
+    - 2026-06-17 03:59 JST -> 2026-06-16-04JST
+    - 2026-06-17 04:00 JST -> 2026-06-17-04JST
+    """
+    now_utc = now_utc or datetime.now(timezone.utc)
+    now_jst = now_utc.astimezone(JST)
+    if now_jst.hour < AUTO_UPDATE_HOUR_JST:
+        effective_date = (now_jst.date() - timedelta(days=1)).isoformat()
+    else:
+        effective_date = now_jst.date().isoformat()
+    return f"{effective_date}-{AUTO_UPDATE_HOUR_JST:02d}JST"
+
+
+def get_next_jst_auto_update_text(now_utc: datetime | None = None) -> str:
+    now_utc = now_utc or datetime.now(timezone.utc)
+    now_jst = now_utc.astimezone(JST)
+    next_jst = now_jst.replace(hour=AUTO_UPDATE_HOUR_JST, minute=0, second=0, microsecond=0)
+    if now_jst >= next_jst:
+        next_jst += timedelta(days=1)
+    return next_jst.strftime("%Y-%m-%d %H:%M JST")
+
+
+@st.cache_data(show_spinner=False)
+def collect_and_rank_cached(
+    auto_update_key: str,
+    selected_sources: tuple[str, ...],
+    selected_categories: tuple[str, ...],
+    lookback_hours: int,
+    max_entries_per_feed: int,
+    request_interval_sec: float,
+    timeout_sec: int,
+    include_undated: bool,
+    include_summary_for_scoring: bool,
+    min_unique_terms: int,
+    ranking_limit: int,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, int]]:
+    return collect_and_rank(
+        selected_sources=list(selected_sources),
+        selected_categories=list(selected_categories),
+        lookback_hours=lookback_hours,
+        max_entries_per_feed=max_entries_per_feed,
+        request_interval_sec=request_interval_sec,
+        timeout_sec=timeout_sec,
+        include_undated=include_undated,
+        include_summary_for_scoring=include_summary_for_scoring,
+        min_unique_terms=min_unique_terms,
+        ranking_limit=ranking_limit,
+        auto_update_key=auto_update_key,
+        show_progress=False,
+    )
 
 
 def df_to_csv_bytes(df: pd.DataFrame) -> bytes:
@@ -2098,8 +2157,15 @@ def render_result_cards(df: pd.DataFrame) -> None:
 def main() -> None:
     st.set_page_config(page_title="海外で注目されている日本のニュースランキング", layout="wide")
     st.title("海外で注目されている日本のニュースランキング")
-    st.caption("海外ニュースサイトを周回して日本のニュースと思われる記事を独自アルゴリズムでランキング化しています。日本以外のニュースもわずかに含まれます。")
-    st.caption("翻訳機能は無いのでブラウザの日本語翻訳などをお使いください。")
+    st.markdown(
+        """
+        <div style="color:#000000; font-size:0.95rem; line-height:1.6; margin-top:0.25rem; margin-bottom:1rem;">
+            <div>海外ニュースサイトを周回して日本のニュースと思われる記事を独自アルゴリズムでランキング化しています。日本以外のニュースもわずかに含まれます。</div>
+            <div>翻訳機能は無いのでブラウザの日本語翻訳などをお使いください。</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # Public users can only run the ranking with fixed/default settings.
     # All configuration controls are shown only after admin authentication.
@@ -2121,9 +2187,10 @@ def main() -> None:
     admin_panel_requested = False
     admin_password_ok = False
 
-    with st.sidebar:
-        run = st.button("RSSを巡回してランキング作成", type="primary")
+    auto_update_key = get_jst_auto_update_key()
+    force_refresh_requested = False
 
+    with st.sidebar:
         if configured_admin_password:
             st.markdown("---")
             admin_panel_requested = st.checkbox("管理者画面を開く", value=False)
@@ -2137,6 +2204,9 @@ def main() -> None:
                 st.markdown("---")
                 st.header("管理者設定")
                 st.caption(f"app version: {APP_VERSION}")
+                st.caption(f"自動更新: 毎日04:00 JST / 現在の更新枠: {auto_update_key}")
+                st.caption(f"次回更新目安: {get_next_jst_auto_update_text()}")
+                force_refresh_requested = st.button("今すぐ再取得（管理者）")
                 st.caption(
                     f"固定設定: 対象期間 {FIXED_LOOKBACK_HOURS}時間 / "
                     f"RSSごとの最大取得件数 {FIXED_MAX_ENTRIES_PER_FEED}件 / "
@@ -2160,9 +2230,6 @@ def main() -> None:
                 )
         # Secrets未設定時は、公開画面に警告を出さず管理者欄を完全に非表示にする。
 
-    if not run:
-        return
-
     if max_entries_per_feed <= 0:
         st.warning("RSSごとの最大取得件数が0なので、取得対象がありません。")
         return
@@ -2170,10 +2237,15 @@ def main() -> None:
         st.warning("媒体またはカテゴリが未選択です。")
         return
 
+    if force_refresh_requested:
+        fetch_feed.clear()
+        collect_and_rank_cached.clear()
+
     with st.spinner("RSSを巡回してランキングを作成しています..."):
-        df, err_df, stats = collect_and_rank(
-            selected_sources=selected_sources,
-            selected_categories=selected_categories,
+        df, err_df, stats = collect_and_rank_cached(
+            auto_update_key=auto_update_key,
+            selected_sources=tuple(selected_sources),
+            selected_categories=tuple(selected_categories),
             lookback_hours=lookback_hours,
             max_entries_per_feed=max_entries_per_feed,
             request_interval_sec=request_interval_sec,
