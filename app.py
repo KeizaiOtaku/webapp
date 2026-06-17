@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import calendar
 import csv
 import math
 import re
@@ -14,15 +13,18 @@ import time
 import unicodedata
 from datetime import datetime, timedelta, timezone
 from io import StringIO
+from types import SimpleNamespace
+import html
+import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 from typing import Any
 from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
 
-import feedparser
 import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "2026-06-17-rss-japan-buzz-300"
+APP_VERSION = "2026-06-17-rss-japan-buzz-300-no-feedparser"
 MAX_RANKING = 30
 
 # Japan / Japanese are intentionally NOT included here.
@@ -524,21 +526,47 @@ def compiled_term_patterns() -> list[tuple[str, re.Pattern]]:
     return [(term, term_pattern(term)) for term in JAPAN_SPECIFIC_TERMS_300]
 
 
+def parse_datetime_string(value: str) -> datetime | None:
+    if not value:
+        return None
+    v = str(value).strip()
+    if not v:
+        return None
+    try:
+        dt = parsedate_to_datetime(v)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+    try:
+        iso = v.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(iso)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
 def parse_entry_datetime(entry: Any) -> datetime | None:
-    for key in ("published_parsed", "updated_parsed", "created_parsed"):
-        parsed = entry.get(key)
+    dt = entry.get("published_dt")
+    if isinstance(dt, datetime):
+        return dt.astimezone(timezone.utc) if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+    for key in ("published", "updated", "created", "pubDate", "dc_date"):
+        parsed = parse_datetime_string(entry.get(key, ""))
         if parsed:
-            try:
-                return datetime.fromtimestamp(calendar.timegm(parsed), tz=timezone.utc)
-            except Exception:
-                pass
+            return parsed
     return None
 
 
 def entry_tags_text(entry: Any) -> str:
     tags = []
     for tag in entry.get("tags", []) or []:
-        term = tag.get("term") if isinstance(tag, dict) else None
+        if isinstance(tag, dict):
+            term = tag.get("term") or tag.get("label")
+        else:
+            term = str(tag)
         if term:
             tags.append(str(term))
     return " ".join(tags)
@@ -585,17 +613,104 @@ def count_japan_terms(item: dict[str, Any], include_summary_for_scoring: bool) -
     }
 
 
+def xml_text(parent: ET.Element | None, names: list[str]) -> str:
+    if parent is None:
+        return ""
+    wanted = {n.lower() for n in names}
+    for child in list(parent):
+        local = child.tag.split("}")[-1].lower()
+        full = child.tag.lower()
+        if local in wanted or full in wanted:
+            text = "".join(child.itertext()).strip()
+            if text:
+                return html.unescape(text)
+    return ""
+
+
+def xml_link(parent: ET.Element | None) -> str:
+    if parent is None:
+        return ""
+    # RSS: <link>https://...</link>
+    txt = xml_text(parent, ["link"])
+    if txt and not txt.lower().startswith("mailto:"):
+        return txt
+    # Atom: <link href="..." rel="alternate"/>
+    for child in list(parent):
+        local = child.tag.split("}")[-1].lower()
+        if local == "link":
+            href = child.attrib.get("href", "")
+            rel = child.attrib.get("rel", "alternate")
+            if href and rel in {"alternate", "", None}:
+                return html.unescape(href.strip())
+    return ""
+
+
+def xml_categories(parent: ET.Element | None) -> list[dict[str, str]]:
+    if parent is None:
+        return []
+    out: list[dict[str, str]] = []
+    for child in list(parent):
+        local = child.tag.split("}")[-1].lower()
+        if local in {"category", "subject"}:
+            value = (child.attrib.get("term") or child.attrib.get("label") or "".join(child.itertext())).strip()
+            if value:
+                out.append({"term": html.unescape(value)})
+    return out
+
+
+def parse_feed_xml(content: bytes) -> SimpleNamespace:
+    root = ET.fromstring(content)
+    root_local = root.tag.split("}")[-1].lower()
+
+    feed_title = xml_text(root, ["title"])
+    entries: list[dict[str, Any]] = []
+
+    if root_local == "rss" or root.find("channel") is not None:
+        channel = root.find("channel")
+        if channel is None:
+            channel = root
+        feed_title = xml_text(channel, ["title"]) or feed_title
+        raw_items = channel.findall("item")
+    else:
+        # Atom or RDF-like feeds: collect direct/descendant entry/item elements.
+        raw_items = [el for el in root.iter() if el.tag.split("}")[-1].lower() in {"entry", "item"}]
+
+    for item in raw_items:
+        published_raw = (
+            xml_text(item, ["pubDate", "published", "updated", "created", "date"])
+            or xml_text(item, ["dc:date"])
+        )
+        entry = {
+            "title": xml_text(item, ["title"]),
+            "link": xml_link(item),
+            "summary": xml_text(item, ["summary", "description", "encoded"]),
+            "description": xml_text(item, ["description"]),
+            "published": published_raw,
+            "updated": xml_text(item, ["updated"]),
+            "created": xml_text(item, ["created"]),
+            "tags": xml_categories(item),
+            "published_dt": parse_datetime_string(published_raw) if published_raw else None,
+        }
+        entries.append(entry)
+
+    return SimpleNamespace(feed={"title": feed_title}, entries=entries)
+
+
 @st.cache_data(ttl=900, show_spinner=False)
-def fetch_feed(url: str, timeout_sec: int) -> tuple[dict[str, Any] | None, str | None]:
+def fetch_feed(url: str, timeout_sec: int) -> tuple[Any | None, str | None]:
     try:
         resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=timeout_sec)
         if resp.status_code >= 400:
             return None, f"HTTP {resp.status_code}"
-        parsed = feedparser.parse(resp.content)
-        if getattr(parsed, "bozo", False):
-            # Feedparser bozo can be non-fatal, so keep parsed entries if any.
-            if not parsed.entries:
-                return None, f"parse error: {getattr(parsed, 'bozo_exception', '')}"
+        content = resp.content or b""
+        if not content.strip():
+            return None, "empty response"
+        try:
+            parsed = parse_feed_xml(content)
+        except Exception as e:
+            return None, f"XML parse error: {e}"
+        if not parsed.entries:
+            return None, "no entries found"
         return parsed, None
     except Exception as e:
         return None, repr(e)
