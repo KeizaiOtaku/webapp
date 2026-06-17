@@ -16,58 +16,29 @@ import streamlit as st
 # 基本設定
 # ============================================================
 
-APP_VERSION = "2026-06-17-fixed10-gdelt-querysyntax-safe"
+APP_VERSION = "2026-06-17-fastmode-japan-japanese-only"
 GDELT_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
 CACHE_TTL_SECONDS = 60 * 30
 USER_AGENT = "overseas-japan-news-streamlit/1.1"
 
-# 企業名・特定作品名・個人名を含まない固定10語
-# 目的: まず広く日本関連ニュースを拾い、詳細な固有名詞はバズワード自動抽出で補う。
+# 高速モード専用: 固定ワードは2種類だけ。
+# 目的: 最小限の固定検索で広く拾い、詳細な固有名詞はバズワード自動抽出で補う。
 FIXED_KEYWORDS_50 = [
     "Japan",
     "Japanese",
-    "Tokyo",
-    "yen",
-    "Bank of Japan",
-    "Japanese economy",
-    "tourism",
-    "anime",
-    "manga",
-    "video games",
 ]
 
-FIXED_KEYWORDS_JA_50 = [
-    "日本",
-    "日本人",
-    "東京",
-    "円",
-    "日銀",
-    "日本経済",
-    "観光",
-    "アニメ",
-    "漫画",
-    "ゲーム",
-]
+# 高速モードでは日本語固定検索は使わない。互換用にだけ残す。
+FIXED_KEYWORDS_JA_50 = []
 
 # これらは単独でも日本関連性が強いのでそのまま検索する
 STANDALONE_TERMS = {
     "japan",
     "japanese",
-    "tokyo",
-    "yen",
-    "bank of japan",
-    "japanese economy",
-    "anime",
-    "manga",
 }
 
-# GDELTは「括弧はOR文だけに使える」という制約があるため、
-# tourism / video games のように単独では広すぎる語は、括弧やANDを使わず
-# `Japan tourism` のような暗黙ANDの単独クエリとして投げる。
-ANCHOR_WITH_JAPAN_TERMS = {
-    "tourism",
-    "video games",
-}
+# 高速モードではJapan/Japaneseだけを固定語にするため、アンカー検索語は使わない。
+ANCHOR_WITH_JAPAN_TERMS = set()
 
 MAJOR_MEDIA_DOMAINS = {
     "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "cnn.com",
@@ -143,7 +114,7 @@ def gdelt_or_group(terms: List[str]) -> str:
 
 def build_fixed_queries_en(domestic: bool, fixed_chunk_size: int) -> List[Tuple[str, str]]:
     """
-    固定10語をGDELT構文エラーが出ない形の複数クエリにする。
+    固定2語をGDELT構文エラーが出ない形のクエリにする。
 
     重要:
     - GDELTは `(<A> AND <B>)` や入れ子括弧に弱い。
@@ -227,6 +198,10 @@ def gdelt_request(
     maxrecords: int,
     retries: int = 5,
 ) -> List[Dict]:
+    # 取得件数0は「この検索を実行しない」として扱う。
+    if int(maxrecords) <= 0:
+        return []
+
     params = {
         "query": query,
         "mode": "artlist",
@@ -649,7 +624,7 @@ def collect_news(timespan: str, maxrecords_fixed: int, maxrecords_buzz: int, max
     all_rows = []
     query_log = []
 
-    # 英語固定10語を、GDELT構文に合う安全なクエリ群へ変換して検索。
+    # 英語固定2語 Japan/Japanese を、GDELT構文に合う安全なクエリへ変換して検索。
     # 括弧はORグループだけに使い、AND/入れ子括弧は使わない。
     for label_over, q_over in build_fixed_queries_en(domestic=False, fixed_chunk_size=fixed_chunk_size):
         query_log.append({"label": label_over, "query": q_over})
@@ -730,7 +705,7 @@ def collect_news(timespan: str, maxrecords_fixed: int, maxrecords_buzz: int, max
 
 st.set_page_config(page_title="海外で相対的に注目される日本ニュース", page_icon="🌏", layout="wide")
 st.title("🌏 海外で相対的に注目される日本ニュース")
-st.caption("固定10ワード + バズワード自動抽出で、海外メディアでは目立つが日本国内メディアでは相対的に小さい話題をランキング化します。")
+st.caption("高速モード専用: 固定ワードは Japan / Japanese の2種類だけ。そこからバズワードを幅広く抽出・追加検索してランキング化します。")
 
 with st.sidebar:
     st.header("設定")
@@ -738,31 +713,45 @@ with st.sidebar:
     with st.form("settings_form"):
         timespan = st.selectbox("対象期間", ["12h", "24h", "48h", "72h", "7d"], index=1)
 
-        light_mode = st.checkbox("軽量モード", value=True, help="GDELTの429や非JSON応答を避けるため、最初はON推奨です。")
+        st.info("高速モード専用です。固定検索は海外1回・国内1回だけ行います。")
 
-        if light_mode:
-            maxrecords_fixed = st.slider("固定クエリ1本あたり最大取得件数", 20, 150, 60, 10)
-            maxrecords_buzz = st.slider("バズワード1件あたり最大取得件数", 10, 80, 30, 10)
-            max_buzzword_queries = st.slider("追加検索するバズワード数", 0, 6, 2, 1)
-            sleep_sec = st.slider("GDELTアクセス間隔 秒（0秒以上）", 0.0, 12.0, 3.0, 0.5)
-            fixed_chunk_size = st.slider("固定語の分割サイズ", 1, 10, 10, 1)
-        else:
-            maxrecords_fixed = st.slider("固定クエリ1本あたり最大取得件数", 20, 250, 100, 10)
-            maxrecords_buzz = st.slider("バズワード1件あたり最大取得件数", 10, 120, 50, 10)
-            max_buzzword_queries = st.slider("追加検索するバズワード数", 0, 10, 4, 1)
-            sleep_sec = st.slider("GDELTアクセス間隔 秒（0秒以上）", 0.0, 15.0, 2.0, 0.5)
-            fixed_chunk_size = st.slider("固定語の分割サイズ", 1, 10, 10, 1)
+        maxrecords_fixed = st.slider(
+            "固定クエリ1本あたり最大取得件数",
+            min_value=0,
+            max_value=250,
+            value=100,
+            step=10,
+            help="0にすると固定検索を実行しません。通常は50〜150程度がおすすめです。",
+        )
+        maxrecords_buzz = st.slider(
+            "バズワード1件あたり最大取得件数",
+            min_value=0,
+            max_value=150,
+            value=40,
+            step=10,
+            help="0にするとバズワード追加検索を実行しません。",
+        )
+        max_buzzword_queries = st.slider(
+            "追加検索するバズワード数",
+            min_value=0,
+            max_value=30,
+            value=6,
+            step=1,
+            help="増やすほど幅広く調べますが、GDELTへのリクエスト数と取得時間が増えます。",
+        )
+        sleep_sec = st.slider(
+            "GDELTアクセス間隔 秒",
+            min_value=0.0,
+            max_value=10.0,
+            value=0.5,
+            step=0.1,
+            help="0.0秒から0.1秒刻みで指定できます。429や非JSONエラーが出る場合は増やしてください。",
+        )
 
         domestic_penalty_alpha = st.slider("国内注目度の減点係数", 0.0, 1.5, 0.7, 0.05)
         min_score = st.slider("表示する最低スコア", -30.0, 50.0, -5.0, 1.0)
         exclude_domestic_heavy = st.checkbox("国内過熱トピックを除外", value=True)
         domestic_ratio_limit = st.slider("国内記事数 / 海外記事数 の除外倍率", 1.0, 10.0, 3.0, 0.5)
-
-        include_japanese_domestic_terms = st.checkbox(
-            "国内検索に日本語10ワードも使う",
-            value=False,
-            help="GDELTが日本語クエリで不安定になる場合があるため、まずはOFF推奨です。",
-        )
 
         submitted = st.form_submit_button("ニュースを取得・ランキング化")
 
@@ -776,15 +765,15 @@ with st.sidebar:
     st.caption("データ出典: GDELT Project DOC 2.0 API")
 
 if submitted:
-    with st.spinner("GDELTから取得中です。クエリを小分けにしてアクセス間隔を入れています。"):
+    with st.spinner("GDELTから取得中です。高速モードで固定2語とバズワード検索を実行しています。"):
         result = collect_news(
             timespan=timespan,
             maxrecords_fixed=maxrecords_fixed,
             maxrecords_buzz=maxrecords_buzz,
             max_buzzword_queries=max_buzzword_queries,
             sleep_sec=sleep_sec,
-            include_japanese_domestic_terms=include_japanese_domestic_terms,
-            fixed_chunk_size=fixed_chunk_size,
+            include_japanese_domestic_terms=False,
+            fixed_chunk_size=2,
         )
         ranking_df = build_ranking(
             rows=result["rows"],
@@ -803,9 +792,9 @@ if result is None:
     st.markdown("### このアプリの仕組み")
     st.markdown(
         """
-- 固定10ワードをGDELT構文に合う小クエリへ変換して投げます。
+- 固定ワードは Japan / Japanese の2種類だけです。
 - GDELTがJSON以外を返した場合は、レスポンス冒頭をエラーに表示します。
-- 海外記事タイトルからバズワードを自動抽出し、上位だけ追加検索します。
+- 海外記事タイトルからバズワードを自動抽出し、指定数だけ追加検索します。
 - 海外記事数・海外媒体数・海外国数・大手媒体数を加点します。
 - 日本国内メディアで多く報じられている話題は減点します。
 - AIの従量課金APIは使っていません。
@@ -831,7 +820,7 @@ col4.metric("ランキング件数", 0 if ranking_df is None else len(ranking_df
 
 if errors:
     with st.expander("GDELT取得エラー・警告", expanded=True):
-        st.warning("一部のGDELT取得でエラーが出ました。取得自体が部分成功していればランキングは表示できます。頻発する場合は、軽量モードON、取得件数削減、アクセス間隔増加、日本語50ワードOFFを試してください。")
+        st.warning("一部のGDELT取得でエラーが出ました。取得自体が部分成功していればランキングは表示できます。頻発する場合は、取得件数削減、バズワード数削減、アクセス間隔増加を試してください。")
         for e in errors:
             st.code(e)
 
