@@ -26,14 +26,14 @@ import pandas as pd
 import requests
 import streamlit as st
 
-APP_VERSION = "2026-06-17-rss-japan-buzz-top1000-allcategory-exclusions"
+APP_VERSION = "2026-06-17-rss-japan-buzz-top1000-hardblocked-playstation-mod"
 DEFAULT_RANKING_LIMIT = 30
 MAX_RANKING_LIMIT = 100
 
 # Japan / Japanese are intentionally NOT included here.
 # The term list is an all-category curated top-1000 list of Japan-specific terms.
 # It is NOT category-ratio balanced. Category is set to "all" for all terms.
-# Terms containing "Japan"/"Japanese" and exact terms "PlayStation"/"MOD" are intentionally excluded.
+# Terms containing/normalizing to blocked words are intentionally excluded from scoring and display.
 JAPAN_SPECIFIC_TERMS_1000_RECORDS = [{'id': 1, 'category': 'all', 'term': 'LDP', 'weight': 1.0},
  {'id': 2, 'category': 'all', 'term': 'Komeito', 'weight': 1.0},
  {'id': 3, 'category': 'all', 'term': 'CDP', 'weight': 1.0},
@@ -1035,13 +1035,43 @@ JAPAN_SPECIFIC_TERMS_1000_RECORDS = [{'id': 1, 'category': 'all', 'term': 'LDP',
  {'id': 999, 'category': 'all', 'term': 'Tokyo Game Show', 'weight': 1.05},
  {'id': 1000, 'category': 'all', 'term': 'Kyoto Animation', 'weight': 1.05}]
 
+BLOCKED_EXACT_NORMALIZED_TERMS = {"japan", "japanese", "mod"}
+BLOCKED_COMPACT_TERMS = {"japan", "japanese", "playstation", "mod"}
+BLOCKED_SUBSTRINGS_COMPACT = {"playstation"}
+
+
+def normalize_term_for_blocklist(term: str) -> str:
+    t = unicodedata.normalize("NFKC", str(term or "")).lower()
+    t = re.sub(r"[‐-―\-/_.:+|#?=&%]+", " ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+def is_blocked_term(term: str) -> bool:
+    """Hard block terms that should never appear in scoring or Matched terms."""
+    norm = normalize_term_for_blocklist(term)
+    compact = norm.replace(" ", "")
+    if norm in BLOCKED_EXACT_NORMALIZED_TERMS or compact in BLOCKED_COMPACT_TERMS:
+        return True
+    if any(bad in compact for bad in BLOCKED_SUBSTRINGS_COMPACT):
+        return True
+    # Block exact tokens only for short acronyms like MOD. This does not block words like "module".
+    tokens = set(re.findall(r"[a-z0-9]+", norm))
+    if tokens & BLOCKED_EXACT_NORMALIZED_TERMS:
+        return True
+    return False
+
+
+_RAW_TERM_COUNT = len(JAPAN_SPECIFIC_TERMS_1000_RECORDS)
+JAPAN_SPECIFIC_TERMS_1000_RECORDS = [
+    r for r in JAPAN_SPECIFIC_TERMS_1000_RECORDS
+    if not is_blocked_term(str(r.get("term", "")))
+]
 JAPAN_SPECIFIC_TERMS_1000 = [r["term"] for r in JAPAN_SPECIFIC_TERMS_1000_RECORDS]
 TERM_CATEGORY_BY_TERM = {r["term"]: r["category"] for r in JAPAN_SPECIFIC_TERMS_1000_RECORDS}
 TERM_WEIGHT_BY_TERM = {r["term"]: float(r.get("weight", 1.0)) for r in JAPAN_SPECIFIC_TERMS_1000_RECORDS}
 REPEAT_DECAY_FACTOR = 0.5
-assert len(JAPAN_SPECIFIC_TERMS_1000) == 1000
-assert all("japan" not in t.lower() and "japanese" not in t.lower() for t in JAPAN_SPECIFIC_TERMS_1000)
-assert all(t.strip().lower() not in {"playstation", "mod"} for t in JAPAN_SPECIFIC_TERMS_1000)
+assert all(not is_blocked_term(t) for t in JAPAN_SPECIFIC_TERMS_1000)
 
 # Conservative initial RSS list.
 # Excluded from this initial list: Guardian, Washington Post, Le Monde, Google News RSS, Reuters RSS.
@@ -1329,6 +1359,9 @@ def count_japan_terms(item: dict[str, Any], include_summary_for_scoring: bool) -
     term_decayed_scores: dict[str, float] = {}
 
     for term, category, base_weight, pat in compiled_term_patterns():
+        # Defensive hard block: even if an old CSV/app cache exists, these terms never score or display.
+        if is_blocked_term(term):
+            continue
         n = len(pat.findall(text))
         if n <= 0:
             continue
