@@ -1,669 +1,1247 @@
-# -*- coding: utf-8 -*-
-"""
-海外注目度だけが高い日本ニュースランキング Streamlit app
-
-- 無料・オープンな GDELT DOC 2.0 API のみを使用します。APIキー不要。
-- Google News RSS / NewsAPI / AI API / LLM従量課金は使用しません。
-- 50種類の一般固定ワード + 海外記事タイトルからのバズワード自動抽出で検索範囲を拡張します。
-- 国内ニュースで注目されている話題は減点し、「海外で相対的に目立つ日本ニュース」を上位表示します。
-
-実行:
-    pip install -r requirements.txt
-    streamlit run app_overseas_japan_news.py
-"""
-
-from __future__ import annotations
-
 import math
+import random
 import re
 import time
-from collections import Counter, defaultdict
-from dataclasses import dataclass
+from collections import Counter
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Tuple
-from urllib.parse import urlencode, urlparse
+from typing import Dict, List, Tuple
+from urllib.parse import urlparse
 
 import pandas as pd
 import requests
 import streamlit as st
 
+
+# ============================================================
+# 基本設定
+# ============================================================
+
+APP_VERSION = "2026-06-17-rate-limit-safe"
+
 GDELT_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
 
-# -----------------------------------------------------------------------------
-# 1. 50 fixed general keywords: no company names, no specific titles, no people.
-# -----------------------------------------------------------------------------
-FIXED_KEYWORDS: List[Dict[str, str]] = [
-    {"en": "Japan", "jp": "日本", "category": "general"},
-    {"en": "Japanese", "jp": "日本人", "category": "general"},
-    {"en": "Tokyo", "jp": "東京", "category": "general"},
-    {"en": "Kyoto", "jp": "京都", "category": "travel_culture"},
-    {"en": "Osaka", "jp": "大阪", "category": "general"},
-    {"en": "Hokkaido", "jp": "北海道", "category": "travel_culture"},
-    {"en": "Okinawa", "jp": "沖縄", "category": "travel_culture"},
-    {"en": "yen", "jp": "円", "category": "economy"},
-    {"en": "Bank of Japan", "jp": "日銀", "category": "economy"},
-    {"en": "Japanese economy", "jp": "日本経済", "category": "economy"},
-    {"en": "inflation", "jp": "インフレ", "category": "economy"},
-    {"en": "interest rates", "jp": "金利", "category": "economy"},
-    {"en": "stock market", "jp": "株式市場", "category": "economy"},
-    {"en": "Nikkei", "jp": "日経平均", "category": "economy"},
-    {"en": "tourism", "jp": "観光", "category": "travel_culture"},
-    {"en": "travel", "jp": "旅行", "category": "travel_culture"},
-    {"en": "overtourism", "jp": "オーバーツーリズム", "category": "travel_culture"},
-    {"en": "culture", "jp": "文化", "category": "travel_culture"},
-    {"en": "tradition", "jp": "伝統", "category": "travel_culture"},
-    {"en": "anime", "jp": "アニメ", "category": "entertainment"},
-    {"en": "manga", "jp": "漫画", "category": "entertainment"},
-    {"en": "video games", "jp": "ゲーム", "category": "entertainment"},
-    {"en": "J-pop", "jp": "J-POP", "category": "entertainment"},
-    {"en": "film", "jp": "映画", "category": "entertainment"},
-    {"en": "drama", "jp": "ドラマ", "category": "entertainment"},
-    {"en": "celebrity", "jp": "芸能", "category": "entertainment"},
-    {"en": "music", "jp": "音楽", "category": "entertainment"},
-    {"en": "fashion", "jp": "ファッション", "category": "entertainment"},
-    {"en": "food", "jp": "食", "category": "travel_culture"},
-    {"en": "sushi", "jp": "寿司", "category": "travel_culture"},
-    {"en": "ramen", "jp": "ラーメン", "category": "travel_culture"},
-    {"en": "matcha", "jp": "抹茶", "category": "travel_culture"},
-    {"en": "sake", "jp": "日本酒", "category": "travel_culture"},
-    {"en": "onsen", "jp": "温泉", "category": "travel_culture"},
-    {"en": "shrine", "jp": "神社", "category": "travel_culture"},
-    {"en": "temple", "jp": "寺", "category": "travel_culture"},
-    {"en": "samurai", "jp": "侍", "category": "travel_culture"},
-    {"en": "ninja", "jp": "忍者", "category": "travel_culture"},
-    {"en": "earthquake", "jp": "地震", "category": "disaster"},
-    {"en": "typhoon", "jp": "台風", "category": "disaster"},
-    {"en": "volcano", "jp": "火山", "category": "disaster"},
-    {"en": "heatwave", "jp": "猛暑", "category": "disaster"},
-    {"en": "politics", "jp": "政治", "category": "politics"},
-    {"en": "election", "jp": "選挙", "category": "politics"},
-    {"en": "prime minister", "jp": "首相", "category": "politics"},
-    {"en": "defense", "jp": "防衛", "category": "politics"},
-    {"en": "military", "jp": "軍事", "category": "politics"},
-    {"en": "demographics", "jp": "人口", "category": "society"},
-    {"en": "aging population", "jp": "高齢化", "category": "society"},
-    {"en": "birth rate", "jp": "出生率", "category": "society"},
+CACHE_TTL_SECONDS = 60 * 30  # 30分キャッシュ
+
+DEFAULT_TIMESPAN = "24h"
+DEFAULT_MAXRECORDS_FIXED = 250
+DEFAULT_MAXRECORDS_BUZZ = 50
+
+USER_AGENT = "overseas-japan-news-streamlit/1.0"
+
+# 企業名・特定作品名・個人名を含まない固定50語
+FIXED_KEYWORDS_50 = [
+    "Japan",
+    "Japanese",
+    "Tokyo",
+    "Kyoto",
+    "Osaka",
+    "Hokkaido",
+    "Okinawa",
+    "yen",
+    "Bank of Japan",
+    "Japanese economy",
+    "inflation",
+    "interest rates",
+    "stock market",
+    "Nikkei",
+    "tourism",
+    "travel",
+    "overtourism",
+    "culture",
+    "tradition",
+    "anime",
+    "manga",
+    "video games",
+    "J-pop",
+    "film",
+    "drama",
+    "celebrity",
+    "music",
+    "fashion",
+    "food",
+    "sushi",
+    "ramen",
+    "matcha",
+    "sake",
+    "onsen",
+    "shrine",
+    "temple",
+    "samurai",
+    "ninja",
+    "earthquake",
+    "typhoon",
+    "volcano",
+    "heatwave",
+    "politics",
+    "election",
+    "prime minister",
+    "defense",
+    "military",
+    "demographics",
+    "aging population",
+    "birth rate",
 ]
 
-STRONG_JAPAN_TERMS = {
-    "Japan", "Japanese", "Tokyo", "Kyoto", "Osaka", "Hokkaido", "Okinawa", "yen",
-    "Bank of Japan", "Japanese economy", "Nikkei", "anime", "manga", "J-pop",
-    "sushi", "ramen", "matcha", "sake", "onsen", "samurai", "ninja",
-}
+FIXED_KEYWORDS_JA_50 = [
+    "日本",
+    "日本人",
+    "東京",
+    "京都",
+    "大阪",
+    "北海道",
+    "沖縄",
+    "円",
+    "日銀",
+    "日本経済",
+    "インフレ",
+    "金利",
+    "株式市場",
+    "日経平均",
+    "観光",
+    "旅行",
+    "オーバーツーリズム",
+    "文化",
+    "伝統",
+    "アニメ",
+    "漫画",
+    "ゲーム",
+    "J-POP",
+    "映画",
+    "ドラマ",
+    "芸能",
+    "音楽",
+    "ファッション",
+    "食",
+    "寿司",
+    "ラーメン",
+    "抹茶",
+    "日本酒",
+    "温泉",
+    "神社",
+    "寺",
+    "侍",
+    "忍者",
+    "地震",
+    "台風",
+    "火山",
+    "猛暑",
+    "政治",
+    "選挙",
+    "首相",
+    "防衛",
+    "軍事",
+    "人口",
+    "高齢化",
+    "出生率",
+]
 
-CATEGORY_DOMESTIC_PENALTY = {
-    "entertainment": 0.30,
-    "travel_culture": 0.40,
-    "economy": 0.65,
-    "politics": 0.75,
-    "disaster": 0.70,
-    "society": 0.60,
-    "general": 0.55,
-    "buzz": 0.50,
-}
+# 単独で日本関連性が強い語
+STANDALONE_TERMS = [
+    "Japan",
+    "Japanese",
+    "Tokyo",
+    "Kyoto",
+    "Osaka",
+    "Hokkaido",
+    "Okinawa",
+    "yen",
+    "Bank of Japan",
+    "Nikkei",
+    "anime",
+    "manga",
+    "J-pop",
+    "sushi",
+    "ramen",
+    "matcha",
+    "sake",
+    "onsen",
+    "shrine",
+    "temple",
+    "samurai",
+    "ninja",
+]
+
+# Japan/Japanese/Tokyoなどとセットにする語
+ANCHORED_TERMS = [
+    "economy",
+    "inflation",
+    "interest rates",
+    "stock market",
+    "tourism",
+    "travel",
+    "overtourism",
+    "culture",
+    "tradition",
+    "video games",
+    "film",
+    "drama",
+    "celebrity",
+    "music",
+    "fashion",
+    "food",
+    "earthquake",
+    "typhoon",
+    "volcano",
+    "heatwave",
+    "politics",
+    "election",
+    "prime minister",
+    "defense",
+    "military",
+    "demographics",
+    "aging population",
+    "birth rate",
+]
 
 MAJOR_MEDIA_DOMAINS = {
-    "reuters.com", "apnews.com", "bbc.com", "bbc.co.uk", "cnn.com", "nytimes.com",
-    "theguardian.com", "ft.com", "bloomberg.com", "wsj.com", "washingtonpost.com",
-    "politico.com", "dw.com", "france24.com", "aljazeera.com", "abc.net.au",
-    "cbc.ca", "scmp.com", "straitstimes.com", "channelnewsasia.com", "rfi.fr",
-    "lemonde.fr", "elpais.com", "spiegel.de", "economist.com", "forbes.com",
-    "hollywoodreporter.com", "variety.com", "deadline.com", "ign.com", "gamespot.com",
+    "reuters.com",
+    "apnews.com",
+    "bbc.com",
+    "bbc.co.uk",
+    "cnn.com",
+    "nytimes.com",
+    "washingtonpost.com",
+    "theguardian.com",
+    "ft.com",
+    "bloomberg.com",
+    "wsj.com",
+    "cnbc.com",
+    "forbes.com",
+    "economist.com",
+    "politico.com",
+    "axios.com",
+    "npr.org",
+    "aljazeera.com",
+    "dw.com",
+    "france24.com",
+    "lemonde.fr",
+    "elpais.com",
+    "scmp.com",
+    "straitstimes.com",
+    "abc.net.au",
+    "theglobeandmail.com",
+    "cbc.ca",
 }
 
-COMMON_TERMS = {
-    "japan", "japanese", "tokyo", "kyoto", "osaka", "hokkaido", "okinawa", "news",
-    "new", "latest", "update", "updates", "world", "today", "report", "reports",
-    "says", "said", "after", "before", "over", "under", "from", "into", "with",
-    "without", "about", "could", "would", "should", "will", "may", "might", "first",
-    "last", "more", "most", "best", "top", "video", "live", "watch", "photos",
-    "analysis", "explained", "guide", "review", "opinion", "press", "agency",
-    "reuters", "associated press", "ap news", "bbc", "cnn", "guardian", "bloomberg",
+STOPWORDS = {
+    "the", "a", "an", "and", "or", "but", "if", "then", "than", "with", "without",
+    "for", "from", "into", "onto", "over", "under", "after", "before", "about",
+    "this", "that", "these", "those", "there", "their", "they", "them", "its",
+    "his", "her", "she", "him", "you", "your", "our", "ours", "who", "what",
+    "when", "where", "why", "how", "new", "news", "says", "said", "say",
+    "report", "reports", "reported", "update", "live", "latest", "world",
+    "global", "international", "breaking", "watch", "video", "photos",
+    "photo", "analysis", "opinion", "explained", "could", "would", "should",
+    "may", "might", "will", "can", "one", "two", "first", "last",
+    "japan", "japanese", "tokyo", "kyoto", "osaka", "hokkaido", "okinawa",
 }
 
-# -----------------------------------------------------------------------------
-# 2. Utilities
-# -----------------------------------------------------------------------------
-
-def normalize_domain(url_or_domain: str) -> str:
-    if not url_or_domain:
-        return ""
-    value = str(url_or_domain).strip().lower()
-    if "://" in value:
-        parsed = urlparse(value)
-        value = parsed.netloc
-    value = value.replace("www.", "")
-    return value.split(":")[0]
-
-
-def clean_text(text: Any) -> str:
-    if text is None:
-        return ""
-    text = str(text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def parse_gdelt_date(value: Any) -> Optional[pd.Timestamp]:
-    if value is None or pd.isna(value):
-        return None
-    s = str(value).strip()
-    if not s:
-        return None
-    try:
-        # Typical: 20260617123000 or 20260617123000.000
-        s2 = re.sub(r"\D", "", s)[:14]
-        if len(s2) >= 8:
-            fmt = "%Y%m%d%H%M%S" if len(s2) >= 14 else "%Y%m%d"
-            return pd.to_datetime(datetime.strptime(s2[:14] if len(s2) >= 14 else s2[:8], fmt), utc=True)
-    except Exception:
-        pass
-    try:
-        return pd.to_datetime(s, utc=True, errors="coerce")
-    except Exception:
-        return None
+CATEGORY_KEYWORDS = {
+    "エンタメ・文化": {
+        "anime", "manga", "film", "movie", "drama", "celebrity", "music",
+        "fashion", "j-pop", "game", "games", "video", "culture", "tradition",
+        "samurai", "ninja", "shrine", "temple", "food", "sushi", "ramen",
+        "matcha", "sake", "onsen",
+    },
+    "経済・金融": {
+        "yen", "boj", "bank", "economy", "inflation", "rates", "interest",
+        "stock", "market", "nikkei", "bond", "currency", "deflation",
+    },
+    "政治・外交・防衛": {
+        "politics", "election", "prime", "minister", "defense", "military",
+        "security", "diplomacy", "china", "korea", "taiwan", "government",
+    },
+    "災害・気象": {
+        "earthquake", "typhoon", "volcano", "heatwave", "flood", "tsunami",
+        "weather", "disaster",
+    },
+    "観光・社会": {
+        "tourism", "travel", "overtourism", "tourist", "demographics",
+        "aging", "birth", "population", "society",
+    },
+}
 
 
-def is_japan_source(sourcecountry: Any, domain: str = "") -> bool:
-    v = str(sourcecountry or "").strip().lower()
-    if v in {"japan", "ja", "jp", "jpn"}:
-        return True
-    # Fallback only when metadata is missing. Keep conservative.
-    d = normalize_domain(domain)
-    return d.endswith(".jp") or d.endswith("co.jp") or d.endswith("or.jp") or d.endswith("ne.jp")
+# ============================================================
+# GDELTクエリ生成
+# ============================================================
 
-
-def category_for_term(term: str) -> str:
-    t = term.lower()
-    for item in FIXED_KEYWORDS:
-        if item["en"].lower() == t or item["jp"].lower() == t:
-            return item["category"]
-    return "buzz"
-
-
-def quote_if_needed(term: str) -> str:
+def quote_term(term: str) -> str:
     term = term.strip()
-    if not term:
-        return term
     if " " in term or "-" in term:
         return f'"{term}"'
     return term
 
 
-def build_fixed_query(term: str) -> str:
-    """Make broad Japan-related query without relying on sourcecountry filters."""
-    if term in STRONG_JAPAN_TERMS:
-        return quote_if_needed(term)
-    return f'({quote_if_needed(term)} AND (Japan OR Japanese OR Tokyo))'
+def make_or_query(terms: List[str]) -> str:
+    return " OR ".join(quote_term(t) for t in terms if t.strip())
 
 
-def build_buzz_query(term: str) -> str:
-    term = term.strip()
-    return f'({quote_if_needed(term)} AND (Japan OR Japanese OR Tokyo OR anime OR manga OR yen))'
+def build_base_query_en() -> str:
+    standalone = make_or_query(STANDALONE_TERMS)
+    anchored = make_or_query(ANCHORED_TERMS)
+    anchors = '(Japan OR Japanese OR Tokyo OR Kyoto OR Osaka)'
+    return f'(({standalone}) OR ({anchors} AND ({anchored})))'
 
 
-def title_tokens(title: str) -> set:
-    t = title.lower()
-    t = re.sub(r"https?://\S+", " ", t)
-    t = re.sub(r"[^a-z0-9一-龯ぁ-んァ-ヶー]+", " ", t)
-    toks = {x for x in t.split() if len(x) >= 3 and x not in COMMON_TERMS}
-    return toks
+def build_base_query_ja() -> str:
+    return f'({make_or_query(FIXED_KEYWORDS_JA_50)})'
 
 
-def jaccard(a: set, b: set) -> float:
-    if not a or not b:
-        return 0.0
-    return len(a & b) / max(1, len(a | b))
+def build_overseas_query() -> str:
+    base_en = build_base_query_en()
+    return f'({base_en}) -sourcecountry:japan'
 
-# -----------------------------------------------------------------------------
-# 3. GDELT fetcher
-# -----------------------------------------------------------------------------
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def fetch_gdelt(query: str, timespan: str, maxrecords: int, sort: str = "datedesc") -> pd.DataFrame:
+def build_domestic_query(include_japanese_terms: bool = True) -> str:
+    base_en = build_base_query_en()
+    if include_japanese_terms:
+        base_ja = build_base_query_ja()
+        return f'(({base_en}) OR ({base_ja})) sourcecountry:japan'
+    return f'({base_en}) sourcecountry:japan'
+
+
+def sanitize_buzzword_for_query(word: str) -> str:
+    word = word.strip()
+    word = re.sub(r'["“”]', "", word)
+    word = re.sub(r"[:(){}\[\]]", " ", word)
+    word = re.sub(r"\s+", " ", word).strip()
+    return word
+
+
+def build_buzz_query(word: str, domestic: bool, include_japanese_anchor: bool = False) -> str:
+    word = sanitize_buzzword_for_query(word)
+    if not word:
+        return ""
+
+    if " " in word:
+        w = f'"{word}"'
+    else:
+        w = word
+
+    if domestic:
+        if include_japanese_anchor:
+            return f'({w}) sourcecountry:japan'
+        return f'({w}) sourcecountry:japan'
+
+    return f'({w}) AND (Japan OR Japanese OR Tokyo OR Kyoto OR Osaka) -sourcecountry:japan'
+
+
+# ============================================================
+# GDELT取得
+# ============================================================
+
+def gdelt_request(
+    query: str,
+    timespan: str = DEFAULT_TIMESPAN,
+    maxrecords: int = DEFAULT_MAXRECORDS_FIXED,
+    retries: int = 5,
+) -> List[Dict]:
     params = {
         "query": query,
         "mode": "artlist",
         "format": "json",
-        "maxrecords": int(max(1, min(maxrecords, 250))),
+        "maxrecords": int(maxrecords),
         "timespan": timespan,
-        "sort": sort,
+        "sort": "datedesc",
     }
-    url = f"{GDELT_ENDPOINT}?{urlencode(params)}"
-    headers = {"User-Agent": "overseas-japan-news-ranker/1.0; contact=your-email@example.com"}
-    try:
-        resp = requests.get(url, timeout=30, headers=headers)
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception as e:
-        return pd.DataFrame([{"_error": str(e), "_query": query}])
 
-    arts = payload.get("articles", []) if isinstance(payload, dict) else []
-    rows = []
-    for a in arts:
-        if not isinstance(a, dict):
-            continue
-        rows.append({
-            "title": clean_text(a.get("title")),
-            "url": clean_text(a.get("url")),
-            "domain": normalize_domain(a.get("domain") or a.get("url")),
-            "language": clean_text(a.get("language")),
-            "sourcecountry": clean_text(a.get("sourcecountry")),
-            "seendate": clean_text(a.get("seendate")),
-            "socialimage": clean_text(a.get("socialimage")),
-            "query": query,
-        })
-    return pd.DataFrame(rows)
+    last_error = None
+
+    for attempt in range(retries):
+        try:
+            response = requests.get(
+                GDELT_ENDPOINT,
+                params=params,
+                timeout=30,
+                headers={"User-Agent": USER_AGENT},
+            )
+
+            if response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                if retry_after and retry_after.isdigit():
+                    wait_sec = int(retry_after)
+                else:
+                    wait_sec = min(75, 3 * (2 ** attempt)) + random.uniform(0, 3)
+
+                time.sleep(wait_sec)
+                continue
+
+            response.raise_for_status()
+            data = response.json()
+            return data.get("articles", []) or []
+
+        except Exception as e:
+            last_error = e
+            wait_sec = min(60, 2 * (2 ** attempt)) + random.uniform(0, 2)
+            time.sleep(wait_sec)
+
+    raise RuntimeError(f"GDELT取得失敗: {last_error}")
 
 
-def fetch_many_queries(
-    queries: List[str],
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def fetch_gdelt_cached(
+    query: str,
     timespan: str,
     maxrecords: int,
-    max_calls: int,
-    sleep_sec: float,
-    progress_label: str,
-) -> pd.DataFrame:
-    frames = []
-    unique_queries = []
-    for q in queries:
-        if q not in unique_queries:
-            unique_queries.append(q)
-    unique_queries = unique_queries[:max_calls]
-
-    progress = st.progress(0, text=progress_label)
-    total = max(1, len(unique_queries))
-    for i, q in enumerate(unique_queries, start=1):
-        frames.append(fetch_gdelt(q, timespan, maxrecords))
-        progress.progress(i / total, text=f"{progress_label}: {i}/{total}")
-        if sleep_sec > 0 and i < total:
-            time.sleep(sleep_sec)
-    progress.empty()
-
-    if not frames:
-        return pd.DataFrame()
-    df = pd.concat(frames, ignore_index=True)
-    if "_error" in df.columns:
-        errors = df[df["_error"].notna()] if "_error" in df else pd.DataFrame()
-        if not errors.empty:
-            st.warning(f"一部のGDELT取得でエラー: {errors['_error'].dropna().head(3).tolist()}")
-        df = df[df.get("url", pd.Series(dtype=str)).notna()].copy()
-    if df.empty:
-        return df
-    df["title"] = df["title"].fillna("").astype(str)
-    df["url"] = df["url"].fillna("").astype(str)
-    df = df[df["url"].str.len() > 0]
-    df = df.drop_duplicates(subset=["url"]).copy()
-    df["domain"] = df["domain"].map(normalize_domain)
-    df["seen_ts"] = df["seendate"].map(parse_gdelt_date)
-    df["is_domestic"] = df.apply(lambda r: is_japan_source(r.get("sourcecountry"), r.get("domain")), axis=1)
-    df["is_overseas"] = ~df["is_domestic"]
-    df["major_media"] = df["domain"].isin(MAJOR_MEDIA_DOMAINS)
-    return df
-
-# -----------------------------------------------------------------------------
-# 4. Buzzword extraction
-# -----------------------------------------------------------------------------
-
-def extract_buzzwords(df: pd.DataFrame, top_n: int = 25) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame(columns=["term", "count", "domain_count", "score"])
-
-    overseas = df[df["is_overseas"]].copy()
-    counts: Counter[str] = Counter()
-    domains_by_term: Dict[str, set] = defaultdict(set)
-
-    fixed_lower = {x["en"].lower() for x in FIXED_KEYWORDS} | {x["jp"].lower() for x in FIXED_KEYWORDS}
-
-    for _, row in overseas.iterrows():
-        title = clean_text(row.get("title"))
-        domain = normalize_domain(row.get("domain"))
-        if not title:
-            continue
-
-        candidates: List[str] = []
-
-        # Capitalized phrases: useful for names, titles, events, places.
-        candidates += re.findall(
-            r"\b(?:[A-Z][A-Za-z0-9&'’.-]{2,}\s+){0,4}[A-Z][A-Za-z0-9&'’.-]{2,}\b",
-            title,
-        )
-        # ALL CAPS / mixed product-like terms, but avoid single-letter noise.
-        candidates += re.findall(r"\b[A-Z][A-Z0-9&.-]{2,}\b", title)
-        # Japanese/Korean/Chinese chunks if they appear in title.
-        candidates += re.findall(r"[一-龯ぁ-んァ-ヶー]{3,}", title)
-
-        for cand in candidates:
-            cand = re.sub(r"\s+", " ", cand).strip(" -–—:;,.!?()[]{}'\"")
-            low = cand.lower()
-            if len(cand) < 3 or len(cand) > 70:
-                continue
-            if low in COMMON_TERMS or low in fixed_lower:
-                continue
-            if any(low == c or low.startswith(c + " ") for c in COMMON_TERMS):
-                continue
-            # Too generic: all words common/generic.
-            words = re.findall(r"[A-Za-z0-9一-龯ぁ-んァ-ヶー]+", low)
-            if not words or all(w in COMMON_TERMS for w in words):
-                continue
-            # Avoid pure media domain names.
-            if domain and low.replace(" ", "") in domain.replace(".", ""):
-                continue
-            counts[cand] += 1
-            domains_by_term[cand].add(domain)
-
-    rows = []
-    for term, cnt in counts.items():
-        domain_count = len(domains_by_term[term])
-        if cnt < 2 and domain_count < 2:
-            continue
-        score = cnt + 1.5 * domain_count
-        rows.append({"term": term, "count": cnt, "domain_count": domain_count, "score": score})
-
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return out
-    out = out.sort_values(["score", "domain_count", "count"], ascending=False).head(top_n).reset_index(drop=True)
-    return out
-
-# -----------------------------------------------------------------------------
-# 5. Clustering and scoring
-# -----------------------------------------------------------------------------
-
-def cluster_articles(df: pd.DataFrame, sim_threshold: float = 0.28) -> pd.DataFrame:
-    if df.empty:
-        return pd.DataFrame()
-
-    df = df.copy().reset_index(drop=True)
-    df["tokens"] = df["title"].map(title_tokens)
-    clusters: List[Dict[str, Any]] = []
-    cluster_ids: List[int] = []
-
-    # More recent and title-rich articles first.
-    df = df.sort_values(["seen_ts", "title"], ascending=[False, True], na_position="last").reset_index(drop=True)
-
-    for idx, row in df.iterrows():
-        toks = row["tokens"]
-        best_id = None
-        best_score = 0.0
-        for cid, c in enumerate(clusters):
-            s = jaccard(toks, c["tokens"])
-            if s > best_score:
-                best_score = s
-                best_id = cid
-        if best_id is not None and best_score >= sim_threshold:
-            cluster_ids.append(best_id)
-            clusters[best_id]["tokens"] |= toks
-        else:
-            cluster_ids.append(len(clusters))
-            clusters.append({"tokens": set(toks)})
-
-    df["cluster_id"] = cluster_ids
-    return df
-
-
-def infer_cluster_category(group: pd.DataFrame) -> str:
-    text = " ".join((group["query"].fillna("") + " " + group["title"].fillna("")).tolist()).lower()
-    category_score = Counter()
-    for item in FIXED_KEYWORDS:
-        en = item["en"].lower()
-        jp = item["jp"].lower()
-        if en in text or jp in text:
-            category_score[item["category"]] += 1
-    if not category_score:
-        return "buzz"
-    return category_score.most_common(1)[0][0]
-
-
-def compute_rankings(df: pd.DataFrame, min_overseas_articles: int, min_overseas_ratio: float) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if df.empty:
-        return pd.DataFrame(), pd.DataFrame()
-
-    clustered = cluster_articles(df)
-    rows = []
-
-    for cid, g in clustered.groupby("cluster_id"):
-        overseas = g[g["is_overseas"]]
-        domestic = g[g["is_domestic"]]
-        if overseas.empty:
-            continue
-
-        overseas_articles = int(overseas["url"].nunique())
-        domestic_articles = int(domestic["url"].nunique())
-        if overseas_articles < min_overseas_articles:
-            continue
-
-        overseas_domains = int(overseas["domain"].nunique())
-        domestic_domains = int(domestic["domain"].nunique()) if not domestic.empty else 0
-        overseas_countries = int(overseas["sourcecountry"].replace("", pd.NA).dropna().nunique())
-        major_count = int(overseas["major_media"].sum())
-        category = infer_cluster_category(g)
-        penalty_coef = CATEGORY_DOMESTIC_PENALTY.get(category, 0.55)
-
-        # Recency: latest article gets modest boost.
-        latest = overseas["seen_ts"].dropna().max()
-        recency_bonus = 0.0
-        if pd.notna(latest):
-            hours_old = max(0.0, (pd.Timestamp.now(tz="UTC") - latest).total_seconds() / 3600)
-            recency_bonus = max(0.0, 3.0 - hours_old / 12.0)
-
-        overseas_score = (
-            5.0 * math.log1p(overseas_articles)
-            + 2.2 * overseas_domains
-            + 2.0 * overseas_countries
-            + 2.5 * major_count
-            + recency_bonus
-        )
-        domestic_penalty = (
-            5.0 * math.log1p(domestic_articles)
-            + 1.6 * domestic_domains
-        )
-        final_score = overseas_score - penalty_coef * domestic_penalty
-        overseas_ratio = overseas_articles / max(1, domestic_articles)
-
-        # Emphasize “海外だけ高い”; keep broad but remove obviously domestic-heavy clusters.
-        if overseas_ratio < min_overseas_ratio and domestic_articles >= overseas_articles:
-            continue
-
-        rep = overseas.sort_values(["major_media", "seen_ts"], ascending=[False, False], na_position="last").iloc[0]
-        example_titles = overseas["title"].dropna().drop_duplicates().head(5).tolist()
-        example_links = overseas[["title", "domain", "sourcecountry", "url", "seendate"]].drop_duplicates("url").head(10).to_dict("records")
-
-        rows.append({
-            "rank_title": rep["title"],
-            "category": category,
-            "final_score": round(final_score, 2),
-            "overseas_score": round(overseas_score, 2),
-            "domestic_penalty": round(penalty_coef * domestic_penalty, 2),
-            "domestic_penalty_coef": penalty_coef,
-            "overseas_articles": overseas_articles,
-            "domestic_articles": domestic_articles,
-            "overseas_ratio": round(overseas_ratio, 2),
-            "overseas_domains": overseas_domains,
-            "overseas_countries": overseas_countries,
-            "major_media_articles": major_count,
-            "latest_seen": str(latest) if pd.notna(latest) else "",
-            "representative_domain": rep["domain"],
-            "representative_country": rep["sourcecountry"],
-            "representative_url": rep["url"],
-            "example_titles": example_titles,
-            "example_links": example_links,
-            "cluster_id": cid,
-        })
-
-    ranking = pd.DataFrame(rows)
-    if not ranking.empty:
-        ranking = ranking.sort_values(["final_score", "overseas_articles", "overseas_domains"], ascending=False).reset_index(drop=True)
-        ranking.insert(0, "rank", range(1, len(ranking) + 1))
-    return ranking, clustered.drop(columns=["tokens"], errors="ignore")
-
-# -----------------------------------------------------------------------------
-# 6. Streamlit UI
-# -----------------------------------------------------------------------------
-
-def main() -> None:
-    st.set_page_config(page_title="海外注目の日本ニュースランキング", layout="wide")
-    st.title("海外注目度だけが高い日本ニュースランキング")
-    st.caption("50固定ワード + バズワード自動抽出 / GDELTのみ / AI従量課金なし")
-
-    with st.sidebar:
-        st.header("取得設定")
-        hours = st.selectbox("対象期間", [6, 12, 24, 48, 72, 168], index=2, format_func=lambda x: f"直近{x}時間")
-        maxrecords = st.slider("1クエリあたり最大記事数", 20, 250, 120, 10)
-        max_fixed_calls = st.slider("固定ワード検索の最大API呼び出し", 20, 100, 70, 5)
-        use_jp_queries = st.checkbox("国内減点補強用に日本語ワードも検索", value=True)
-        buzz_top_n = st.slider("抽出するバズワード数", 5, 50, 25, 5)
-        use_buzz_search = st.checkbox("抽出バズワードで追加検索", value=True)
-        max_buzz_calls = st.slider("バズワード追加検索の最大API呼び出し", 0, 50, 20, 5)
-        min_overseas_articles = st.slider("最低海外記事数", 1, 10, 2, 1)
-        min_overseas_ratio = st.slider("海外/国内 最低比率", 0.0, 10.0, 2.0, 0.5)
-        sleep_sec = st.slider("API呼び出し間隔 秒", 0.0, 2.0, 0.15, 0.05)
-        run = st.button("ニュースを収集・ランキング化", type="primary")
-
-    st.info(
-        "このアプリは記事本文を転載せず、GDELTが返す見出し・URL・媒体・国などのメタデータをランキング化します。"
-        "公開運用時は各ニュース媒体の本文や画像の再利用を避け、元記事リンクへの誘導に留めるのが安全です。"
-    )
-
-    fixed_table = pd.DataFrame(FIXED_KEYWORDS)
-    with st.expander("固定ワード50種類を見る"):
-        st.dataframe(fixed_table, use_container_width=True, hide_index=True)
-
-    if not run:
-        st.stop()
-
-    timespan = f"{hours}h"
-    fixed_queries: List[str] = []
-    for item in FIXED_KEYWORDS:
-        fixed_queries.append(build_fixed_query(item["en"]))
-        if use_jp_queries:
-            fixed_queries.append(item["jp"])
-
-    df_fixed = fetch_many_queries(
-        fixed_queries,
-        timespan=timespan,
-        maxrecords=maxrecords,
-        max_calls=max_fixed_calls,
-        sleep_sec=sleep_sec,
-        progress_label="固定ワード検索中",
-    )
-
-    if df_fixed.empty:
-        st.error("記事を取得できませんでした。対象期間を広げるか、API呼び出し数を増やしてください。")
-        st.stop()
-
-    buzz_df = extract_buzzwords(df_fixed, top_n=buzz_top_n)
-
-    df_all = df_fixed.copy()
-    if use_buzz_search and not buzz_df.empty and max_buzz_calls > 0:
-        buzz_queries = [build_buzz_query(t) for t in buzz_df["term"].head(max_buzz_calls).tolist()]
-        df_buzz = fetch_many_queries(
-            buzz_queries,
+) -> Tuple[List[Dict], str]:
+    try:
+        articles = gdelt_request(
+            query=query,
             timespan=timespan,
             maxrecords=maxrecords,
-            max_calls=max_buzz_calls,
-            sleep_sec=sleep_sec,
-            progress_label="バズワード追加検索中",
         )
-        if not df_buzz.empty:
-            df_all = pd.concat([df_all, df_buzz], ignore_index=True).drop_duplicates(subset=["url"])
-            df_all["seen_ts"] = df_all["seendate"].map(parse_gdelt_date)
-            df_all["is_domestic"] = df_all.apply(lambda r: is_japan_source(r.get("sourcecountry"), r.get("domain")), axis=1)
-            df_all["is_overseas"] = ~df_all["is_domestic"]
-            df_all["major_media"] = df_all["domain"].isin(MAJOR_MEDIA_DOMAINS)
+        return articles, ""
+    except Exception as e:
+        return [], str(e)
 
-    ranking, article_df = compute_rankings(
-        df_all,
-        min_overseas_articles=min_overseas_articles,
-        min_overseas_ratio=min_overseas_ratio,
+
+# ============================================================
+# 正規化・判定
+# ============================================================
+
+def get_domain(url: str, fallback_domain: str = "") -> str:
+    if fallback_domain:
+        return str(fallback_domain).lower().strip()
+
+    try:
+        parsed = urlparse(url)
+        domain = parsed.netloc.lower()
+        domain = domain.replace("www.", "")
+        return domain
+    except Exception:
+        return ""
+
+
+def is_japan_domain(domain: str) -> bool:
+    domain = str(domain).lower().strip()
+    if not domain:
+        return False
+
+    jp_suffixes = (
+        ".jp",
+        ".co.jp",
+        ".ne.jp",
+        ".or.jp",
+        ".ac.jp",
+        ".go.jp",
+        ".ed.jp",
+        ".lg.jp",
+    )
+    return domain.endswith(jp_suffixes)
+
+
+def is_japan_source(sourcecountry: str, domain: str) -> bool:
+    sc = str(sourcecountry or "").lower().strip()
+
+    if sc in {"japan", "jp", "jpn", "ja"}:
+        return True
+
+    if "japan" in sc:
+        return True
+
+    if is_japan_domain(domain):
+        return True
+
+    return False
+
+
+def parse_gdelt_datetime(value: str):
+    if not value:
+        return pd.NaT
+
+    s = str(value).strip()
+
+    try:
+        if re.fullmatch(r"\d{14}", s):
+            return pd.to_datetime(datetime.strptime(s, "%Y%m%d%H%M%S"), utc=True)
+        return pd.to_datetime(s, utc=True, errors="coerce")
+    except Exception:
+        return pd.NaT
+
+
+def get_first(article: Dict, keys: List[str], default=""):
+    for key in keys:
+        if key in article and article.get(key) is not None:
+            return article.get(key)
+    return default
+
+
+def normalize_article(article: Dict, origin_hint: str, query_label: str) -> Dict:
+    url = get_first(article, ["url", "url_mobile"], "")
+    title = get_first(article, ["title"], "")
+    domain = get_domain(url, get_first(article, ["domain"], ""))
+    sourcecountry = get_first(article, ["sourcecountry", "sourceCountry", "source_country"], "")
+    language = get_first(article, ["language", "lang"], "")
+    seendate_raw = get_first(article, ["seendate", "seenDate", "date"], "")
+
+    detected_domestic = is_japan_source(sourcecountry, domain)
+
+    if origin_hint == "domestic":
+        origin = "domestic"
+    elif origin_hint == "overseas":
+        origin = "domestic" if detected_domestic else "overseas"
+    else:
+        origin = "domestic" if detected_domestic else "overseas"
+
+    return {
+        "title": str(title or "").strip(),
+        "url": str(url or "").strip(),
+        "domain": domain,
+        "sourcecountry": str(sourcecountry or "").strip(),
+        "language": str(language or "").strip(),
+        "seendate": parse_gdelt_datetime(seendate_raw),
+        "seendate_raw": str(seendate_raw or ""),
+        "origin": origin,
+        "query_label": query_label,
+        "socialimage": get_first(article, ["socialimage"], ""),
+    }
+
+
+def deduplicate_articles(rows: List[Dict]) -> List[Dict]:
+    seen = set()
+    out = []
+
+    for row in rows:
+        url = row.get("url", "")
+        title = row.get("title", "")
+        domain = row.get("domain", "")
+
+        key = url if url else f"{domain}::{title}"
+        if not key:
+            continue
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+        out.append(row)
+
+    return out
+
+
+# ============================================================
+# バズワード抽出
+# ============================================================
+
+TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9&'’\-.]{2,}|[一-龥ぁ-んァ-ヴー]{2,}")
+CAP_PHRASE_RE = re.compile(
+    r"\b[A-Z][A-Za-z0-9&'’\-.]+(?:\s+[A-Z][A-Za-z0-9&'’\-.]+){0,3}\b"
+)
+
+
+def normalize_token(token: str) -> str:
+    token = token.strip().lower()
+    token = token.strip(".,!?;:()[]{}\"'“”‘’")
+    return token
+
+
+def title_tokens(title: str) -> set:
+    raw_tokens = TOKEN_RE.findall(title or "")
+    tokens = set()
+
+    fixed_lower = {normalize_token(x) for x in FIXED_KEYWORDS_50}
+    fixed_parts = set()
+    for kw in fixed_lower:
+        for part in kw.split():
+            fixed_parts.add(part)
+
+    for token in raw_tokens:
+        t = normalize_token(token)
+
+        if len(t) < 3:
+            continue
+        if t in STOPWORDS:
+            continue
+        if t in fixed_parts:
+            continue
+        if re.fullmatch(r"\d+", t):
+            continue
+
+        tokens.add(t)
+
+    return tokens
+
+
+def is_bad_buzzword(word: str) -> bool:
+    w = word.strip()
+    wl = normalize_token(w)
+
+    if not w:
+        return True
+
+    if len(w) < 3:
+        return True
+
+    if wl in STOPWORDS:
+        return True
+
+    if wl in {normalize_token(x) for x in FIXED_KEYWORDS_50}:
+        return True
+
+    if re.fullmatch(r"\d+", wl):
+        return True
+
+    if wl in {
+        "monday", "tuesday", "wednesday", "thursday", "friday",
+        "saturday", "sunday", "january", "february", "march",
+        "april", "june", "july", "august", "september", "october",
+        "november", "december",
+    }:
+        return True
+
+    return False
+
+
+def extract_buzzwords(articles: List[Dict], top_n: int = 10) -> pd.DataFrame:
+    phrase_counter = Counter()
+    token_counter = Counter()
+    domain_map = {}
+
+    overseas_articles = [a for a in articles if a.get("origin") == "overseas"]
+
+    for article in overseas_articles:
+        title = article.get("title", "")
+        domain = article.get("domain", "")
+
+        # 固有名詞っぽい大文字フレーズ
+        for phrase in CAP_PHRASE_RE.findall(title):
+            phrase = phrase.strip()
+            phrase = re.sub(r"\s+", " ", phrase)
+
+            if is_bad_buzzword(phrase):
+                continue
+
+            words = [normalize_token(x) for x in phrase.split()]
+            if all(x in STOPWORDS for x in words):
+                continue
+
+            phrase_counter[phrase] += 1
+            domain_map.setdefault(phrase, set()).add(domain)
+
+        # 単語
+        for token in title_tokens(title):
+            if is_bad_buzzword(token):
+                continue
+            token_counter[token] += 1
+            domain_map.setdefault(token, set()).add(domain)
+
+    rows = []
+
+    for word, count in phrase_counter.items():
+        domains = domain_map.get(word, set())
+        score = count * 2.0 + len(domains) * 1.5
+        rows.append({
+            "buzzword": word,
+            "count": count,
+            "unique_domains": len(domains),
+            "score": score,
+            "type": "phrase",
+        })
+
+    for word, count in token_counter.items():
+        domains = domain_map.get(word, set())
+        score = count * 1.0 + len(domains) * 1.2
+        rows.append({
+            "buzzword": word,
+            "count": count,
+            "unique_domains": len(domains),
+            "score": score,
+            "type": "token",
+        })
+
+    if not rows:
+        return pd.DataFrame(columns=["buzzword", "count", "unique_domains", "score", "type"])
+
+    df = pd.DataFrame(rows)
+    df = df.sort_values(["score", "unique_domains", "count"], ascending=False)
+    df = df.drop_duplicates(subset=["buzzword"])
+    return df.head(top_n).reset_index(drop=True)
+
+
+# ============================================================
+# クラスタリング・スコアリング
+# ============================================================
+
+def jaccard(a: set, b: set) -> float:
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
+def infer_category(tokens: set, title: str) -> str:
+    text = " ".join(tokens).lower() + " " + (title or "").lower()
+
+    best_category = "その他"
+    best_hits = 0
+
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        hits = sum(1 for kw in keywords if kw in text)
+        if hits > best_hits:
+            best_hits = hits
+            best_category = category
+
+    return best_category
+
+
+def cluster_articles(
+    overseas_rows: List[Dict],
+    domestic_rows: List[Dict],
+    similarity_threshold: float = 0.28,
+) -> List[Dict]:
+    clusters = []
+
+    # 海外記事でクラスタを作る
+    sorted_overseas = sorted(
+        overseas_rows,
+        key=lambda x: x.get("seendate") if pd.notna(x.get("seendate")) else pd.Timestamp.min.tz_localize("UTC"),
+        reverse=True,
     )
 
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("取得記事数", f"{len(df_all):,}")
-    c2.metric("海外記事数", f"{int(df_all['is_overseas'].sum()):,}")
-    c3.metric("国内記事数", f"{int(df_all['is_domestic'].sum()):,}")
-    c4.metric("ユニーク媒体数", f"{df_all['domain'].nunique():,}")
+    for article in sorted_overseas:
+        tokens = title_tokens(article.get("title", ""))
 
-    tab1, tab2, tab3, tab4 = st.tabs(["ランキング", "バズワード", "全記事", "CSVダウンロード"])
+        if not tokens:
+            continue
 
-    with tab1:
-        if ranking.empty:
-            st.warning("条件を満たすランキング候補がありません。対象期間、最低海外記事数、海外/国内比率を緩めてください。")
+        assigned = False
+
+        for cluster in clusters:
+            sim = jaccard(tokens, cluster["tokens"])
+            overlap = len(tokens & cluster["tokens"])
+
+            if sim >= similarity_threshold or overlap >= 3:
+                cluster["overseas_articles"].append(article)
+                cluster["tokens"] |= tokens
+                assigned = True
+                break
+
+        if not assigned:
+            clusters.append({
+                "tokens": set(tokens),
+                "overseas_articles": [article],
+                "domestic_articles": [],
+            })
+
+    # 国内記事を近い海外クラスタに割り当てる
+    for article in domestic_rows:
+        tokens = title_tokens(article.get("title", ""))
+
+        if not tokens:
+            continue
+
+        best_idx = None
+        best_sim = 0.0
+        best_overlap = 0
+
+        for i, cluster in enumerate(clusters):
+            sim = jaccard(tokens, cluster["tokens"])
+            overlap = len(tokens & cluster["tokens"])
+
+            if sim > best_sim or overlap > best_overlap:
+                best_idx = i
+                best_sim = sim
+                best_overlap = overlap
+
+        if best_idx is not None and (best_sim >= 0.18 or best_overlap >= 2):
+            clusters[best_idx]["domestic_articles"].append(article)
+
+    return clusters
+
+
+def is_major_media(domain: str) -> bool:
+    domain = str(domain or "").lower().replace("www.", "")
+    if domain in MAJOR_MEDIA_DOMAINS:
+        return True
+
+    # サブドメイン対策
+    for major in MAJOR_MEDIA_DOMAINS:
+        if domain.endswith("." + major):
+            return True
+
+    return False
+
+
+def score_cluster(cluster: Dict, domestic_penalty_alpha: float = 0.7) -> Dict:
+    overseas_articles = cluster["overseas_articles"]
+    domestic_articles = cluster["domestic_articles"]
+
+    overseas_domains = {a.get("domain", "") for a in overseas_articles if a.get("domain")}
+    domestic_domains = {a.get("domain", "") for a in domestic_articles if a.get("domain")}
+    overseas_countries = {
+        a.get("sourcecountry", "")
+        for a in overseas_articles
+        if a.get("sourcecountry") and not is_japan_source(a.get("sourcecountry"), a.get("domain"))
+    }
+
+    major_count = sum(1 for a in overseas_articles if is_major_media(a.get("domain", "")))
+
+    dates = [
+        a.get("seendate")
+        for a in overseas_articles
+        if pd.notna(a.get("seendate"))
+    ]
+
+    now = pd.Timestamp.now(tz="UTC")
+    if dates:
+        newest = max(dates)
+        hours_old = max(0.0, (now - newest).total_seconds() / 3600)
+        freshness_bonus = max(0.0, 6.0 - hours_old / 6.0)
+    else:
+        freshness_bonus = 0.0
+
+    representative = overseas_articles[0]
+    category = infer_category(cluster["tokens"], representative.get("title", ""))
+
+    # エンタメ・文化は国内で話題になってから海外波及することも多いため、
+    # 国内減点をやや弱める。
+    category_penalty_multiplier = 1.0
+    if category == "エンタメ・文化":
+        category_penalty_multiplier = 0.55
+    elif category == "観光・社会":
+        category_penalty_multiplier = 0.75
+
+    overseas_score = (
+        8.0 * math.log1p(len(overseas_articles))
+        + 4.5 * math.log1p(len(overseas_domains))
+        + 3.5 * math.log1p(len(overseas_countries))
+        + 5.0 * math.log1p(major_count)
+        + freshness_bonus
+    )
+
+    domestic_penalty = category_penalty_multiplier * domestic_penalty_alpha * (
+        7.0 * math.log1p(len(domestic_articles))
+        + 2.0 * math.log1p(len(domestic_domains))
+    )
+
+    final_score = overseas_score - domestic_penalty
+
+    countries_str = ", ".join(sorted([c for c in overseas_countries if c]))[:200]
+    domains_str = ", ".join(sorted(list(overseas_domains))[:8])
+
+    return {
+        "score": round(final_score, 2),
+        "overseas_score": round(overseas_score, 2),
+        "domestic_penalty": round(domestic_penalty, 2),
+        "category": category,
+        "representative_title": representative.get("title", ""),
+        "representative_url": representative.get("url", ""),
+        "representative_domain": representative.get("domain", ""),
+        "overseas_articles": len(overseas_articles),
+        "domestic_articles": len(domestic_articles),
+        "overseas_domains": len(overseas_domains),
+        "domestic_domains": len(domestic_domains),
+        "overseas_countries": len(overseas_countries),
+        "major_media_articles": major_count,
+        "countries": countries_str,
+        "domains": domains_str,
+        "tokens": " / ".join(sorted(list(cluster["tokens"]))[:12]),
+        "cluster": cluster,
+    }
+
+
+def build_ranking(
+    rows: List[Dict],
+    domestic_penalty_alpha: float,
+    min_score: float,
+    exclude_domestic_heavy: bool,
+    domestic_ratio_limit: float,
+) -> pd.DataFrame:
+    overseas_rows = [r for r in rows if r.get("origin") == "overseas"]
+    domestic_rows = [r for r in rows if r.get("origin") == "domestic"]
+
+    clusters = cluster_articles(overseas_rows, domestic_rows)
+    scored = [score_cluster(c, domestic_penalty_alpha) for c in clusters]
+
+    if not scored:
+        return pd.DataFrame()
+
+    df = pd.DataFrame(scored)
+
+    if exclude_domestic_heavy:
+        ratio = df["domestic_articles"] / df["overseas_articles"].clip(lower=1)
+        df = df[~((df["domestic_articles"] >= 3) & (ratio >= domestic_ratio_limit))]
+
+    df = df[df["score"] >= min_score]
+    df = df.sort_values(
+        ["score", "overseas_articles", "overseas_domains", "overseas_countries"],
+        ascending=False,
+    ).reset_index(drop=True)
+
+    df.insert(0, "rank", range(1, len(df) + 1))
+    return df
+
+
+# ============================================================
+# 収集処理
+# ============================================================
+
+def polite_sleep(seconds: float):
+    if seconds <= 0:
+        return
+    time.sleep(seconds + random.uniform(0, 0.5))
+
+
+def collect_news(
+    timespan: str,
+    maxrecords_fixed: int,
+    maxrecords_buzz: int,
+    max_buzzword_queries: int,
+    sleep_sec: float,
+    include_japanese_domestic_terms: bool,
+) -> Dict:
+    errors = []
+    all_rows = []
+
+    overseas_query = build_overseas_query()
+    domestic_query = build_domestic_query(include_japanese_terms=include_japanese_domestic_terms)
+
+    overseas_articles, err = fetch_gdelt_cached(
+        overseas_query,
+        timespan,
+        maxrecords_fixed,
+    )
+    if err:
+        errors.append(f"海外固定クエリ: {err}")
+
+    for a in overseas_articles:
+        all_rows.append(normalize_article(a, origin_hint="overseas", query_label="fixed_overseas"))
+
+    polite_sleep(sleep_sec)
+
+    domestic_articles, err = fetch_gdelt_cached(
+        domestic_query,
+        timespan,
+        maxrecords_fixed,
+    )
+    if err:
+        errors.append(f"国内固定クエリ: {err}")
+
+    for a in domestic_articles:
+        all_rows.append(normalize_article(a, origin_hint="domestic", query_label="fixed_domestic"))
+
+    all_rows = deduplicate_articles(all_rows)
+
+    buzz_df = extract_buzzwords(
+        [r for r in all_rows if r.get("origin") == "overseas"],
+        top_n=max(1, max_buzzword_queries * 3),
+    )
+
+    selected_buzzwords = []
+    if not buzz_df.empty and max_buzzword_queries > 0:
+        selected_buzzwords = buzz_df["buzzword"].head(max_buzzword_queries).tolist()
+
+    # バズワード追加検索
+    for buzz in selected_buzzwords:
+        q_over = build_buzz_query(buzz, domestic=False)
+        if q_over:
+            polite_sleep(sleep_sec)
+            articles, err = fetch_gdelt_cached(
+                q_over,
+                timespan,
+                maxrecords_buzz,
+            )
+            if err:
+                errors.append(f"海外バズワード「{buzz}」: {err}")
+            for a in articles:
+                all_rows.append(normalize_article(a, origin_hint="overseas", query_label=f"buzz_overseas:{buzz}"))
+
+        q_dom = build_buzz_query(buzz, domestic=True)
+        if q_dom:
+            polite_sleep(sleep_sec)
+            articles, err = fetch_gdelt_cached(
+                q_dom,
+                timespan,
+                maxrecords_buzz,
+            )
+            if err:
+                errors.append(f"国内バズワード「{buzz}」: {err}")
+            for a in articles:
+                all_rows.append(normalize_article(a, origin_hint="domestic", query_label=f"buzz_domestic:{buzz}"))
+
+    all_rows = deduplicate_articles(all_rows)
+
+    return {
+        "rows": all_rows,
+        "errors": errors,
+        "buzz_df": buzz_df,
+        "selected_buzzwords": selected_buzzwords,
+        "overseas_query": overseas_query,
+        "domestic_query": domestic_query,
+        "collected_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+# ============================================================
+# Streamlit UI
+# ============================================================
+
+st.set_page_config(
+    page_title="海外で相対的に注目される日本ニュース",
+    page_icon="🌏",
+    layout="wide",
+)
+
+st.title("🌏 海外で相対的に注目される日本ニュース")
+st.caption(
+    "固定50ワード + バズワード自動抽出で、海外メディアでは目立つが日本国内メディアでは相対的に小さい話題をランキング化します。"
+)
+
+with st.sidebar:
+    st.header("設定")
+
+    with st.form("settings_form"):
+        timespan = st.selectbox(
+            "対象期間",
+            ["12h", "24h", "48h", "72h", "7d"],
+            index=1,
+        )
+
+        light_mode = st.checkbox(
+            "軽量モード",
+            value=True,
+            help="GDELTの429を避けるため、最初はON推奨です。",
+        )
+
+        if light_mode:
+            maxrecords_fixed = st.slider("固定クエリの最大取得件数", 50, 250, 120, 10)
+            maxrecords_buzz = st.slider("バズワード1件あたり最大取得件数", 20, 100, 40, 10)
+            max_buzzword_queries = st.slider("追加検索するバズワード数", 0, 8, 3, 1)
+            sleep_sec = st.slider("GDELTアクセス間隔 秒", 1.0, 8.0, 3.0, 0.5)
         else:
-            st.subheader("海外だけで相対的に目立つ日本ニュース")
-            display_cols = [
-                "rank", "rank_title", "category", "final_score", "overseas_articles",
-                "domestic_articles", "overseas_ratio", "overseas_domains", "overseas_countries",
-                "major_media_articles", "representative_domain", "representative_country", "representative_url",
-            ]
-            st.dataframe(ranking[display_cols], use_container_width=True, hide_index=True)
+            maxrecords_fixed = st.slider("固定クエリの最大取得件数", 50, 250, 250, 10)
+            maxrecords_buzz = st.slider("バズワード1件あたり最大取得件数", 20, 150, 70, 10)
+            max_buzzword_queries = st.slider("追加検索するバズワード数", 0, 12, 6, 1)
+            sleep_sec = st.slider("GDELTアクセス間隔 秒", 1.0, 10.0, 2.5, 0.5)
 
-            for _, row in ranking.head(20).iterrows():
-                with st.expander(f"#{int(row['rank'])} {row['rank_title']}  / score={row['final_score']}"):
-                    st.write(
-                        f"カテゴリ: **{row['category']}** / 海外記事: **{row['overseas_articles']}** / "
-                        f"国内記事: **{row['domestic_articles']}** / 海外/国内比: **{row['overseas_ratio']}** / "
-                        f"海外媒体: **{row['overseas_domains']}** / 海外国数: **{row['overseas_countries']}**"
-                    )
-                    st.write("代表・関連リンク:")
-                    for link in row["example_links"]:
-                        title = clean_text(link.get("title")) or "article"
-                        domain = clean_text(link.get("domain"))
-                        country = clean_text(link.get("sourcecountry"))
-                        url = clean_text(link.get("url"))
-                        st.markdown(f"- [{title}]({url})  — `{domain}` / `{country}`")
-
-    with tab2:
-        st.subheader("海外記事タイトルから抽出したバズワード候補")
-        if buzz_df.empty:
-            st.write("バズワード候補は見つかりませんでした。")
-        else:
-            st.dataframe(buzz_df, use_container_width=True, hide_index=True)
-
-    with tab3:
-        show_cols = ["title", "domain", "sourcecountry", "language", "is_overseas", "is_domestic", "seendate", "query", "url"]
-        st.dataframe(df_all[show_cols], use_container_width=True, hide_index=True)
-
-    with tab4:
-        st.download_button(
-            "ランキングCSVをダウンロード",
-            data=ranking.drop(columns=["example_titles", "example_links"], errors="ignore").to_csv(index=False).encode("utf-8-sig"),
-            file_name="overseas_japan_news_ranking.csv",
-            mime="text/csv",
-        )
-        st.download_button(
-            "全記事CSVをダウンロード",
-            data=df_all.to_csv(index=False).encode("utf-8-sig"),
-            file_name="overseas_japan_news_articles.csv",
-            mime="text/csv",
-        )
-        st.download_button(
-            "バズワードCSVをダウンロード",
-            data=buzz_df.to_csv(index=False).encode("utf-8-sig"),
-            file_name="overseas_japan_news_buzzwords.csv",
-            mime="text/csv",
+        domestic_penalty_alpha = st.slider(
+            "国内注目度の減点係数",
+            0.0,
+            1.5,
+            0.7,
+            0.05,
+            help="大きくすると、日本国内でも多く報じられている話題が下がります。",
         )
 
-    with st.expander("スコア式"):
-        st.code(
+        min_score = st.slider(
+            "表示する最低スコア",
+            -30.0,
+            50.0,
+            -5.0,
+            1.0,
+        )
+
+        exclude_domestic_heavy = st.checkbox(
+            "国内過熱トピックを除外",
+            value=True,
+            help="国内記事数が海外記事数に対して多すぎるクラスタを除外します。",
+        )
+
+        domestic_ratio_limit = st.slider(
+            "国内記事数 / 海外記事数 の除外倍率",
+            1.0,
+            10.0,
+            3.0,
+            0.5,
+        )
+
+        include_japanese_domestic_terms = st.checkbox(
+            "国内検索に日本語50ワードも使う",
+            value=True,
+            help="国内注目度の検出を強めます。クエリは長くなりますが、リクエスト回数は増えません。",
+        )
+
+        submitted = st.form_submit_button("ニュースを取得・ランキング化")
+
+    if st.button("キャッシュをクリア"):
+        st.cache_data.clear()
+        st.session_state.pop("last_result", None)
+        st.success("キャッシュをクリアしました。")
+
+    st.markdown("---")
+    st.caption(f"App version: {APP_VERSION}")
+    st.caption("データ出典: GDELT Project DOC 2.0 API")
+
+
+if submitted:
+    with st.spinner("GDELTから取得中です。429対策のため、アクセス間隔を入れています。"):
+        result = collect_news(
+            timespan=timespan,
+            maxrecords_fixed=maxrecords_fixed,
+            maxrecords_buzz=maxrecords_buzz,
+            max_buzzword_queries=max_buzzword_queries,
+            sleep_sec=sleep_sec,
+            include_japanese_domestic_terms=include_japanese_domestic_terms,
+        )
+
+        ranking_df = build_ranking(
+            rows=result["rows"],
+            domestic_penalty_alpha=domestic_penalty_alpha,
+            min_score=min_score,
+            exclude_domestic_heavy=exclude_domestic_heavy,
+            domestic_ratio_limit=domestic_ratio_limit,
+        )
+
+        result["ranking_df"] = ranking_df
+        st.session_state["last_result"] = result
+
+
+result = st.session_state.get("last_result")
+
+if result is None:
+    st.info("左サイドバーの設定を確認して、「ニュースを取得・ランキング化」を押してください。")
+    st.markdown("### このアプリの仕組み")
+    st.markdown(
+        """
+- 固定50ワードを1つずつ検索せず、海外用・国内用の大きなクエリにまとめてGDELTへ投げます。
+- 海外記事タイトルから、固有名詞っぽいバズワードを自動抽出します。
+- 上位数件のバズワードだけ追加検索します。
+- 海外記事数、海外媒体数、海外国数、大手媒体数を加点します。
+- 日本国内メディアで多く報じられている話題は減点します。
+- AIの従量課金APIは使っていません。
+        """
+    )
+    st.stop()
+
+
+rows = result["rows"]
+ranking_df = result["ranking_df"]
+errors = result["errors"]
+buzz_df = result["buzz_df"]
+selected_buzzwords = result["selected_buzzwords"]
+
+overseas_count = sum(1 for r in rows if r.get("origin") == "overseas")
+domestic_count = sum(1 for r in rows if r.get("origin") == "domestic")
+
+col1, col2, col3, col4 = st.columns(4)
+col1.metric("取得記事数", len(rows))
+col2.metric("海外記事", overseas_count)
+col3.metric("国内記事", domestic_count)
+col4.metric("ランキング件数", 0 if ranking_df is None else len(ranking_df))
+
+if errors:
+    with st.expander("GDELT取得エラー・警告", expanded=True):
+        st.warning(
+            "一部のGDELT取得でエラーが出ました。429の場合は軽量モード、取得件数削減、アクセス間隔増加、キャッシュ利用を試してください。"
+        )
+        for e in errors:
+            st.code(e)
+
+with st.expander("実際に使ったGDELTクエリ"):
+    st.markdown("#### 海外固定クエリ")
+    st.code(result["overseas_query"])
+    st.markdown("#### 国内固定クエリ")
+    st.code(result["domestic_query"])
+
+if buzz_df is not None and not buzz_df.empty:
+    with st.expander("自動抽出されたバズワード"):
+        st.dataframe(buzz_df, use_container_width=True)
+        st.caption(f"追加検索に使ったバズワード: {', '.join(selected_buzzwords) if selected_buzzwords else 'なし'}")
+
+st.markdown("## ランキング")
+
+if ranking_df is None or ranking_df.empty:
+    st.warning("ランキング対象がありません。対象期間を広げるか、最低スコアを下げてください。")
+    st.stop()
+
+display_columns = [
+    "rank",
+    "score",
+    "category",
+    "representative_title",
+    "representative_domain",
+    "overseas_articles",
+    "domestic_articles",
+    "overseas_domains",
+    "domestic_domains",
+    "overseas_countries",
+    "major_media_articles",
+    "overseas_score",
+    "domestic_penalty",
+    "countries",
+]
+
+st.dataframe(
+    ranking_df[display_columns],
+    use_container_width=True,
+    hide_index=True,
+)
+
+csv_df = ranking_df.drop(columns=["cluster"], errors="ignore")
+csv_bytes = csv_df.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
+
+st.download_button(
+    label="ランキングCSVをダウンロード",
+    data=csv_bytes,
+    file_name="overseas_japan_news_ranking.csv",
+    mime="text/csv",
+)
+
+st.markdown("## 上位トピック詳細")
+
+top_n_detail = min(20, len(ranking_df))
+
+for _, row in ranking_df.head(top_n_detail).iterrows():
+    title = row["representative_title"]
+    score = row["score"]
+    category = row["category"]
+
+    with st.expander(f'#{int(row["rank"])}｜{score}点｜{category}｜{title}'):
+        st.markdown(f"**代表見出し:** {title}")
+
+        if row.get("representative_url"):
+            st.markdown(f'[代表記事を開く]({row["representative_url"]})')
+
+        st.markdown(
+            f"""
+**海外記事数:** {row["overseas_articles"]}  
+**国内記事数:** {row["domestic_articles"]}  
+**海外媒体数:** {row["overseas_domains"]}  
+**国内媒体数:** {row["domestic_domains"]}  
+**海外国数:** {row["overseas_countries"]}  
+**大手海外媒体記事数:** {row["major_media_articles"]}  
+**海外スコア:** {row["overseas_score"]}  
+**国内減点:** {row["domestic_penalty"]}  
+**抽出トークン:** {row["tokens"]}
             """
-海外スコア = 5*log(1+海外記事数) + 2.2*海外媒体数 + 2.0*海外国数 + 2.5*大手媒体記事数 + 新着ボーナス
-国内減点 = カテゴリ別係数 * (5*log(1+国内記事数) + 1.6*国内媒体数)
-最終スコア = 海外スコア - 国内減点
-
-カテゴリ別の国内減点係数:
-- entertainment: 0.30  # エンタメは国内起点で海外波及しやすいので弱め
-- travel_culture: 0.40
-- economy: 0.65
-- politics: 0.75
-- disaster: 0.70
-- society: 0.60
-- general: 0.55
-- buzz: 0.50
-            """.strip(),
-            language="text",
         )
 
+        cluster = row["cluster"]
 
-if __name__ == "__main__":
-    main()
+        overseas_articles = cluster.get("overseas_articles", [])
+        domestic_articles = cluster.get("domestic_articles", [])
+
+        st.markdown("### 海外関連記事")
+        for a in overseas_articles[:10]:
+            t = a.get("title", "")
+            u = a.get("url", "")
+            d = a.get("domain", "")
+            c = a.get("sourcecountry", "")
+            if u:
+                st.markdown(f"- [{t}]({u})  \n  `{d}` / `{c}`")
+            else:
+                st.markdown(f"- {t}  \n  `{d}` / `{c}`")
+
+        if domestic_articles:
+            st.markdown("### 国内関連記事")
+            for a in domestic_articles[:10]:
+                t = a.get("title", "")
+                u = a.get("url", "")
+                d = a.get("domain", "")
+                if u:
+                    st.markdown(f"- [{t}]({u})  \n  `{d}`")
+                else:
+                    st.markdown(f"- {t}  \n  `{d}`")
+        else:
+            st.caption("このクラスタに近い国内関連記事は少ない、または検出されていません。")
+
+st.markdown("---")
+st.caption(
+    "データ出典: GDELT Project DOC 2.0 API。"
+    "本サイトはGDELTが提供するニュースメタデータをもとに、"
+    "海外メディアにおける日本関連ニュースの掲載傾向を独自に集計・ランキング化しています。"
+    "記事本文・画像・見出し等の権利は各配信元に帰属します。"
+)
+st.caption(
+    "注: 国内注目度はSNSバズ度ではなく、GDELT上で日本国内メディアと判定された記事数・媒体数にもとづく近似値です。"
+)
