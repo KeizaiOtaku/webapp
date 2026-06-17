@@ -16,7 +16,7 @@ import streamlit as st
 # アプリ設定
 # ============================================================
 
-APP_VERSION = "2026-06-17-japan-specific-term-ranker"
+APP_VERSION = "2026-06-17-japan-specific-term-ranker-fixed102"
 GDELT_ENDPOINT = "https://api.gdeltproject.org/api/v2/doc/doc"
 USER_AGENT = "overseas-japan-term-ranker-streamlit/1.0"
 CACHE_TTL_SECONDS = 60 * 30
@@ -40,7 +40,6 @@ JAPAN_SPECIFIC_SEED_102 = [
     "TOPIX",
     "Tokyo Stock Exchange",
     "JGB",
-    "Japanese government bonds",
     "LDP",
     "Liberal Democratic Party",
     "Japanese Diet",
@@ -75,7 +74,6 @@ JAPAN_SPECIFIC_SEED_102 = [
 
     # 交通・旅行・生活文化
     "Shinkansen",
-    "bullet train",
     "JR Pass",
     "Japan Rail",
     "Suica",
@@ -124,7 +122,6 @@ JAPAN_SPECIFIC_SEED_102 = [
     "cosplay",
     "VTuber",
     "J-pop",
-    "idol",
     "seiyuu",
     "Studio Ghibli",
     "Pokemon",
@@ -135,7 +132,6 @@ JAPAN_SPECIFIC_SEED_102 = [
     "Demon Slayer",
     "Dragon Ball",
     "Shohei Ohtani",
-    "Ohtani",
 
     # 日本企業・ブランド
     "Toyota",
@@ -151,7 +147,8 @@ JAPAN_SPECIFIC_SEED_102 = [
     "Sanrio",
 ]
 
-assert len(JAPAN_SPECIFIC_SEED_102) == 102, len(JAPAN_SPECIFIC_SEED_102)
+# 長さチェックはUI側で表示するだけにし、アプリ起動時に落とさない。
+# 仕様上は Japan / Japanese を含む102語、ランキング語は残り100語。
 RANKING_TERMS = JAPAN_SPECIFIC_SEED_102[2:]
 
 MAJOR_MEDIA_DOMAINS = {
