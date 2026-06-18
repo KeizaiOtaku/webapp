@@ -11,7 +11,7 @@ import requests
 import streamlit as st
 
 
-APP_VERSION = "v1.8-verified-title-filter-access-interval"
+APP_VERSION = "v2.4-checked-cooldown-records"
 GDELT_DOC_API = "https://api.gdeltproject.org/api/v2/doc/doc"
 CACHE_DIR = Path(".gdelt_cache")
 CACHE_TTL_SECONDS = 60 * 60  # 1 hour
@@ -68,7 +68,8 @@ BROAD_SINGLE_WORDS = {
 def init_state() -> None:
     defaults = {
         "last_api_time": 0.0,
-        "last_df_json": None,
+        "rate_limited_until": 0.0,
+        "last_df_records": [],
         "last_request_url": "",
         "last_result_source": "",
         "last_error": "",
@@ -76,6 +77,11 @@ def init_state() -> None:
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
+
+    # 古い版の不要なセッション値が残っている場合は削除する。
+    old_session_key = "last" + "_df" + "_json"
+    if old_session_key in st.session_state:
+        del st.session_state[old_session_key]
 
 
 def normalize_domain(domain: str) -> str:
@@ -116,8 +122,6 @@ def build_gdelt_query(
         country_filter = country_filter.replace(" ", "")
         parts.append(f"sourcecountry:{country_filter}")
 
-    # raw_query_mode is kept for UI compatibility. In both modes, GDELT receives a text query.
-    # The difference is only the user's expectation/explanation in the UI.
     return " ".join(parts)
 
 
@@ -183,14 +187,29 @@ def fetch_gdelt_articles(query: str, timespan: str, maxrecords: int, sort: str) 
     return pd.DataFrame(data.get("articles", [])), request_url
 
 
+def parse_retry_after_seconds(response: requests.Response) -> float:
+    if response is None:
+        return 0.0
+    raw = response.headers.get("Retry-After", "")
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def is_broad_single_word_query(keyword: str) -> bool:
     cleaned = keyword.lower().strip().strip('"\'')
     return cleaned in BROAD_SINGLE_WORDS
 
 
 def extract_words(text: str) -> List[str]:
-    # Remove common GDELT operators so title filtering does not try to match domain:, sourcelang:, etc.
-    text = re.sub(r"[-+]?\b(?:domain|sourcelang|sourcecountry|theme|near|repeat)\s*:\s*\S+", " ", text, flags=re.I)
+    # domain: や sourcelang: などのGDELT演算子はタイトル照合から外す。
+    text = re.sub(
+        r"[-+]?\b(?:domain|sourcelang|sourcecountry|theme|near|repeat)\s*:\s*\S+",
+        " ",
+        text,
+        flags=re.I,
+    )
     text = re.sub(r"\b(?:AND|OR|NOT)\b", " ", text, flags=re.I)
     tokens = re.findall(r"[A-Za-z0-9一-龥ぁ-んァ-ヶー]+", text)
     return [t.lower() for t in tokens if t.strip()]
@@ -217,7 +236,7 @@ def apply_title_filter(df: pd.DataFrame, filter_text: str, match_mode: str) -> p
             mask = pd.Series(False, index=out.index)
             for word in words:
                 mask = mask | titles.str.contains(re.escape(word), regex=True, na=False)
-        else:  # すべての単語
+        else:
             mask = pd.Series(True, index=out.index)
             for word in words:
                 mask = mask & titles.str.contains(re.escape(word), regex=True, na=False)
@@ -289,6 +308,42 @@ def main() -> None:
     st.caption("入力したキーワードで世界中のニュースを検索し、記事一覧をCSVで保存できます。")
     st.caption(f"アプリ版: {APP_VERSION}")
 
+    st.markdown("### API負荷対策（待機時間の指定）")
+    load_col1, load_col2, load_col3 = st.columns([1, 1, 1])
+    with load_col1:
+        access_interval_sec = st.slider(
+            "APIアクセス最小間隔（秒）",
+            min_value=0.0,
+            max_value=2.0,
+            value=0.5,
+            step=0.05,
+            format="%.2f",
+            help="キャッシュが無い新規検索だけ、この秒数以上あけてGDELT APIへアクセスします。",
+        )
+    with load_col2:
+        cooldown_after_429_sec = st.slider(
+            "429後の検索停止時間（秒）",
+            min_value=10,
+            max_value=600,
+            value=120,
+            step=10,
+            help="429を受けた後、この秒数は新規APIアクセスを止めます。GDELTがRetry-Afterを返した場合は長い方を使います。",
+        )
+    with load_col3:
+        use_cache = st.checkbox("キャッシュを使用する", value=True)
+        if st.button("キャッシュを削除", use_container_width=True):
+            if CACHE_DIR.exists():
+                for path in CACHE_DIR.glob("*.json"):
+                    path.unlink(missing_ok=True)
+            st.success("キャッシュを削除しました。")
+
+    now_for_status = time.time()
+    interval_remaining = max(0.0, access_interval_sec - (now_for_status - float(st.session_state.get("last_api_time", 0.0))))
+    rate_limit_remaining = max(0.0, float(st.session_state.get("rate_limited_until", 0.0)) - now_for_status)
+    status_col1, status_col2 = st.columns(2)
+    status_col1.caption(f"次の新規API送信まで: 約{interval_remaining:.2f}秒")
+    status_col2.caption(f"429クールダウン残り: 約{rate_limit_remaining:.0f}秒")
+
     with st.sidebar:
         st.header("検索条件")
         keyword = st.text_input(
@@ -309,31 +364,7 @@ def main() -> None:
         maxrecords = st.slider("最大取得件数", min_value=10, max_value=250, value=60, step=10)
         sort = st.selectbox("並び順", ["datedesc", "dateasc", "hybridrel"], index=0)
         n_cards = st.slider("カード表示件数", min_value=5, max_value=50, value=15, step=5)
-
-        st.divider()
-        st.header("API負荷対策")
-        access_interval_sec = st.slider(
-            "APIアクセス最小間隔（秒）",
-            min_value=0.0,
-            max_value=2.0,
-            value=0.5,
-            step=0.05,
-            format="%.2f",
-            help="キャッシュが無い新規検索だけ、この秒数以上あけてGDELT APIへアクセスします。",
-        )
-        use_cache = st.checkbox("キャッシュを使用する", value=True)
-        if st.button("キャッシュを削除", use_container_width=True):
-            if CACHE_DIR.exists():
-                for path in CACHE_DIR.glob("*.json"):
-                    path.unlink(missing_ok=True)
-            st.success("キャッシュを削除しました。")
-
-        elapsed = time.time() - float(st.session_state.get("last_api_time", 0.0))
-        remaining = max(0.0, access_interval_sec - elapsed)
-        st.caption(f"次の新規API送信まで: 約{remaining:.2f}秒")
         st.caption(f"アプリ版: {APP_VERSION}")
-
-        search_button = st.button("検索する", type="primary", use_container_width=True)
 
     language = LANGUAGE_MAP[language_label]
     gdelt_query = build_gdelt_query(keyword, raw_query_mode, language, exclude_japanese, domain_filter, country_filter)
@@ -352,6 +383,8 @@ def main() -> None:
             value=keyword,
             help="domain: や -sourcelang: などを含む検索では、ここにタイトル内で一致させたい語だけを書くのがおすすめです。",
         )
+
+    search_button = st.button("検索する", type="primary", use_container_width=True)
 
     if is_broad_single_word_query(keyword):
         st.warning("検索語が広すぎます。例: `Breaking Japan`、`Breaking earthquake`、`Japan semiconductor` のように具体語を足すと429を避けやすくなります。")
@@ -373,7 +406,15 @@ def main() -> None:
                 df, request_url, source = cached_df, cached_url, "cache"
 
         if df.empty:
-            elapsed = time.time() - float(st.session_state.get("last_api_time", 0.0))
+            now = time.time()
+
+            # 429後のクールダウン中はAPIを叩かない。ただし上のキャッシュ表示は許可。
+            rate_limit_remaining = float(st.session_state.get("rate_limited_until", 0.0)) - now
+            if rate_limit_remaining > 0:
+                st.error(f"GDELT 429後のクールダウン中です。残り約{rate_limit_remaining:.0f}秒後に再検索してください。")
+                return
+
+            elapsed = now - float(st.session_state.get("last_api_time", 0.0))
             remaining = access_interval_sec - elapsed
             if remaining > 0:
                 st.warning(f"APIアクセス最小間隔のため、あと約{remaining:.2f}秒待ってから検索してください。")
@@ -388,13 +429,22 @@ def main() -> None:
                     write_disk_cache(current_key, df, request_url)
             except requests.HTTPError as exc:
                 st.session_state["last_api_time"] = time.time()
-                stale_df, stale_url, _ = read_disk_cache(current_key, allow_stale=True)
-                if exc.response is not None and exc.response.status_code == 429 and not stale_df.empty:
-                    st.warning("GDELT APIが429を返しました。保存済みキャッシュを表示します。")
-                    df, request_url, source = stale_df, stale_url, "stale_cache_after_429"
+
+                if exc.response is not None and exc.response.status_code == 429:
+                    retry_after = parse_retry_after_seconds(exc.response)
+                    cooldown = max(float(cooldown_after_429_sec), retry_after)
+                    st.session_state["rate_limited_until"] = time.time() + cooldown
+
+                    stale_df, stale_url, _ = read_disk_cache(current_key, allow_stale=True)
+                    if use_cache and not stale_df.empty:
+                        st.warning(f"GDELT APIが429を返しました。約{cooldown:.0f}秒クールダウンします。保存済みキャッシュを表示します。")
+                        df, request_url, source = stale_df, stale_url, "stale_cache_after_429"
+                    else:
+                        st.error(f"GDELT APIが429を返しました。約{cooldown:.0f}秒待ってから再検索してください。")
+                        return
                 else:
                     st.error(f"GDELT APIのHTTPエラーです: {exc}")
-                    st.caption("最大取得件数を減らす、期間を短くする、検索語を具体化する、アクセス間隔を少し上げる、の順で対処してください。")
+                    st.caption("最大取得件数を減らす、期間を短くする、検索語を具体化する、の順で対処してください。")
                     return
             except requests.RequestException as exc:
                 st.error(f"通信エラーです: {exc}")
@@ -403,15 +453,16 @@ def main() -> None:
                 st.error(f"JSONの読み取りに失敗しました: {exc}")
                 return
 
-        st.session_state["last_df_json"] = df.to_json(orient="records", force_ascii=False)
+        st.session_state["last_df_records"] = df.to_dict(orient="records")
         st.session_state["last_request_url"] = request_url
         st.session_state["last_result_source"] = source
 
-    if not st.session_state.get("last_df_json"):
+    last_records = st.session_state.get("last_df_records", [])
+    if not last_records:
         st.info("検索条件を設定して「検索する」を押してください。入力変更だけではAPIへアクセスしません。")
         return
 
-    df = pd.read_json(st.session_state["last_df_json"], orient="records")
+    df = pd.DataFrame(last_records)
     request_url = st.session_state.get("last_request_url", "")
     result_source = st.session_state.get("last_result_source", "")
 
@@ -498,9 +549,12 @@ def main() -> None:
             #### この版で入っているもの
             - アプリ版: `{APP_VERSION}`
             - APIアクセス最小間隔: `0.00〜2.00秒 / 0.05秒刻み`
+            - 429後の検索停止時間: `10〜600秒 / 10秒刻み`
+            - GDELTの `Retry-After` 対応
             - 入力変更だけではAPIへアクセスしない設計
             - 1時間のディスクキャッシュ
             - 429時のキャッシュフォールバック
+            - 古いJSON文字列復元方式は不使用
             - タイトル限定フィルター
 
             #### 検索例
